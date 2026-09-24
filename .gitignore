@@ -33,6 +33,11 @@ src/main.build/
 build-dir/
 .ccache/
 
+# Arch package build scratch
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/ventapes/
+
 # Editors and operating systems
 .vscode/
 .idea/
