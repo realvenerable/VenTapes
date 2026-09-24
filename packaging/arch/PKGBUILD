@@ -1,0 +1,126 @@
+# Maintainer: realvenerable <329848724+realvenerable@users.noreply.github.com>
+pkgname=ventapes
+pkgver=0.0.0.pre1
+pkgrel=1
+pkgdesc="Unofficial personal learning fork of the Mixtapes YouTube Music player"
+arch=('x86_64' 'aarch64')
+url="https://github.com/realvenerable/VenTapes"
+license=('GPL3')
+depends=(
+  'python'
+  'python-gobject'
+  'gtk4'
+  'libadwaita'
+  'webkitgtk-6.0'
+  'nodejs'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gst-plugins-bad'
+  'gst-plugins-ugly'
+  'yt-dlp'
+  'yt-dlp-ejs'
+  'python-requests'
+  'python-urllib3'
+  'python-numpy'
+  'python-pillow'
+  'python-ytmusicapi'
+  'python-mutagen'
+  'python-pydbus'
+)
+makedepends=('git' 'python-pip' 'glib2-devel' 'ca-certificates')
+optdepends=('ffmpeg: downloading and converting audio')
+conflicts=('ventapes-git')
+source=("ventapes::git+https://github.com/realvenerable/VenTapes.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/ventapes"
+  local tag
+  tag=$(git describe --tags --exact-match 2>/dev/null || true)
+  if [[ -n "$tag" ]]; then
+    printf '%s\n' "${tag#v}" | sed 's/-/./g'
+  else
+    git rev-parse --short HEAD
+  fi
+}
+
+build() {
+  cd "$srcdir/ventapes"
+
+  glib-compile-resources \
+    --sourcedir=. \
+    src/ventapes.gresource.xml \
+    --target=src/ventapes.gresource
+
+  # These are either unavailable as stable Arch packages or are small
+  # Python-side integrations. Keep them in the package so the runtime does
+  # not depend on an AUR helper or a mutable site-packages install.
+  /usr/bin/python -m pip install \
+    --disable-pip-version-check \
+    --no-input \
+    --no-cache-dir \
+    --target="$srcdir/ventapes-python" \
+    --no-deps \
+    'strenum==0.4.15' \
+    'mprisify @ git+https://gitlab.com/zehkira/mprisify.git@v1.0.0' \
+    'yt-dlp-get-pot>=0.3.0' \
+    'yt-dlp-get-pot-rustypipe>=0.2.0'
+}
+
+package() {
+  cd "$srcdir/ventapes"
+
+  install -d "$pkgdir/usr/lib/ventapes"
+  cp -r src "$pkgdir/usr/lib/ventapes/"
+  cp -r assets "$pkgdir/usr/lib/ventapes/"
+  cp -r "$srcdir/ventapes-python" "$pkgdir/usr/lib/ventapes/python"
+
+  install -Dm644 src/ventapes.gresource \
+    "$pkgdir/usr/lib/ventapes/src/ventapes.gresource"
+  install -Dm644 src/ui/style.css \
+    "$pkgdir/usr/lib/ventapes/src/ui/style.css"
+
+  # The app probes this private path for the optional PO-Token helper.
+  install -d "$pkgdir/usr/lib/ventapes/bin"
+  case "$(uname -m)" in
+    x86_64)
+      botguard_archive="$srcdir/ventapes/vendor/rustypipe-botguard/rustypipe-botguard-v0.1.2-x86_64-unknown-linux-gnu.tar.xz"
+      ;;
+    aarch64)
+      botguard_archive="$srcdir/ventapes/vendor/rustypipe-botguard/rustypipe-botguard-v0.1.2-aarch64-unknown-linux-gnu.tar.xz"
+      ;;
+    *)
+      echo "Unsupported architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+  mkdir -p "$srcdir/ventapes-botguard"
+  tar -xf "$botguard_archive" -C "$srcdir/ventapes-botguard"
+  install -Dm755 "$srcdir/ventapes-botguard/rustypipe-botguard" \
+    "$pkgdir/usr/lib/ventapes/bin/rustypipe-botguard"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 NOTICE.md "$pkgdir/usr/share/licenses/$pkgname/NOTICE.md"
+  install -Dm644 CREDITS.md "$pkgdir/usr/share/licenses/$pkgname/CREDITS.md"
+  install -Dm644 THIRD_PARTY_NOTICES.md \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
+  install -Dm644 vendor/rustypipe-botguard/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/rustypipe-botguard-LICENSE"
+
+  install -Dm644 io.github.realvenerable.VenTapes.desktop \
+    "$pkgdir/usr/share/applications/io.github.realvenerable.VenTapes.desktop"
+  install -Dm644 io.github.realvenerable.VenTapes.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/io.github.realvenerable.VenTapes.metainfo.xml"
+  install -Dm644 assets/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg"
+  install -Dm644 assets/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg \
+    "$pkgdir/usr/share/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg"
+
+  install -d "$pkgdir/usr/bin"
+  cat > "$pkgdir/usr/bin/ventapes" <<'EOF'
+#!/bin/sh
+export PYTHONPATH="/usr/lib/ventapes/python:/usr/lib/ventapes/src${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python /usr/lib/ventapes/src/main.py "$@"
+EOF
+  chmod 755 "$pkgdir/usr/bin/ventapes"
+}

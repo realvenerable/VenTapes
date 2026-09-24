@@ -24,6 +24,7 @@ logs/
 *.gresource
 src/ventapes
 src/main
+*.pkg.tar.*
 build/
 dist/
 target/

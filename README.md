@@ -77,6 +77,18 @@ Some playback formats need a separate `rustypipe-botguard` binary. Without it, o
 
 Last.fm scrobbling needs your own registered API key and secret; set `VENTAPES_LASTFM_API_KEY` and `VENTAPES_LASTFM_API_SECRET` at runtime. This fork does not reuse Mixtapes' credentials. Discord Rich Presence is disabled unless you set a VenTapes-specific `VENTAPES_DISCORD_APP_ID`.
 
+### Arch Linux prerelease
+
+A local Arch `PKGBUILD` is included at [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD). It is not an AUR package and is only a prerelease build of this private experiment:
+
+```bash
+cd packaging/arch
+makepkg -sr
+sudo pacman -U ./ventapes-*.pkg.tar.zst
+```
+
+See [`packaging/arch/README.md`](packaging/arch/README.md) and [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for details.
+
 ### Nix development shell
 
 ```bash
