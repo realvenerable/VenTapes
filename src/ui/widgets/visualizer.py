@@ -1,21 +1,18 @@
-import json
 import math
 import os
 
 from gi.repository import Gtk, GLib
+from ui.preferences import get_bool, get_float, get_int, read_prefs, user_prefs_path
 
 
-_PREFS_PATH = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+_PREFS_PATH = user_prefs_path()
 
 
 def _load_pref(key, default):
     try:
-        if os.path.exists(_PREFS_PATH):
-            with open(_PREFS_PATH) as f:
-                return json.load(f).get(key, default)
+        return read_prefs(_PREFS_PATH, {}).get(key, default)
     except Exception:
-        pass
-    return default
+        return default
 
 
 class Visualizer(Gtk.DrawingArea):
@@ -27,7 +24,7 @@ class Visualizer(Gtk.DrawingArea):
 
     Pipeline per spectrum frame:
 
-    1. Raw 128 spectrum bands (linear in frequency, threshold .. 0 dB).
+    1. Raw spectrum bands (linear in frequency, threshold .. 0 dB).
     2. Drop sub-audible top bands so we don't dedicate display real estate
        to >16 kHz where there's almost never any energy in music.
     3. Reduce to N display bars on a log frequency scale (peak per bin) —
@@ -40,7 +37,7 @@ class Visualizer(Gtk.DrawingArea):
 
     Rendering pipeline:
 
-    - 60 fps tick interpolates each bar toward its target.
+    - 30 fps (20 fps in low-power mode) tick interpolates each bar toward its target.
     - Bars snap UP instantly on a new peak (zero attack).
     - Bars fall under accumulating velocity (gravity acceleration) — the
        classic bouncy "drop" feel.
@@ -81,17 +78,25 @@ class Visualizer(Gtk.DrawingArea):
         self.set_draw_func(self._draw)
 
         # Configurable from preferences.
-        self.display_bars = max(8, min(100, int(_load_pref("visualizer_bars", self.BARS_DEFAULT))))
-        self.smoothing = float(_load_pref("visualizer_smoothing", self.MONSTERCAT_DEFAULT))
-        if self.smoothing < 1.05:
-            self.smoothing = 1.05
-        self.set_visible(bool(_load_pref("visualizer_enabled", True)))
+        prefs = read_prefs(_PREFS_PATH, {})
+        self.display_bars = get_int(
+            prefs, "visualizer_bars", self.BARS_DEFAULT, 8, 100
+        )
+        self.smoothing = get_float(
+            prefs,
+            "visualizer_smoothing",
+            self.MONSTERCAT_DEFAULT,
+            1.05,
+            3.0,
+        )
+        self.set_visible(get_bool(prefs, "visualizer_enabled", True))
 
         self._levels = []
         self._velocities = []
         self._weights = []
         self._tick_id = None
         self._active = False
+        self._playing = False
         self._log_bins = None
         self._raw_bands = 0
         # Auto-sensitivity: this tracks the loudest bar seen in recent
@@ -103,6 +108,8 @@ class Visualizer(Gtk.DrawingArea):
 
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
+        self.connect("destroy", self._on_destroy)
+        self.connect("notify::visible", self._on_visibility_changed)
         self.connect("realize", self._on_realize)
         self.connect("unrealize", self._on_unrealize)
 
@@ -124,30 +131,109 @@ class Visualizer(Gtk.DrawingArea):
             intensity = float(intensity)
         except (TypeError, ValueError):
             return
-        self.smoothing = max(1.05, intensity)
+        if not math.isfinite(intensity):
+            return
+        self.smoothing = max(1.05, min(3.0, intensity))
 
     # ─── Lifecycle ─────────────────────────────────────────────────────────
 
     def _on_realize(self, *_):
-        # Pull-driven now: the tick callback queries player.pull_visualizer_bands
-        # on every frame, so there's no signal to subscribe to.
-        print("[VIZ-WIDGET] realized, will pull spectrum data on tick")
+        # Pull-driven: the tick callback queries
+        # player.pull_visualizer_bands.  Do not start a frame loop merely
+        # because the widget was realized; it may belong to a hidden view.
+        self._update_tick()
 
     def _on_unrealize(self, *_):
-        pass
+        self._stop_tick()
+
+    def _sync_consumer_registration(self):
+        """Register the FFT only for a visible, mapped consumer."""
+
+        registered = bool(
+            self._playing and self._active and self.get_visible() and self.get_mapped()
+        )
+        if hasattr(self.player, "set_visualizer_active"):
+            self.player.set_visualizer_active(self, registered)
+
+    def _on_visibility_changed(self, *_):
+        self._sync_consumer_registration()
+        self._update_tick()
+        if not self.get_visible():
+            self._levels = []
+            self._velocities = []
+            self.queue_draw()
 
     def _on_map(self, *_):
         self._active = True
-        if self._tick_id is None:
-            self._tick_id = GLib.timeout_add(16, self._on_tick)  # 60 fps
+        if (
+            self.player.get_state_string() == "playing"
+            and getattr(self.player, "get_visualizer_enabled", lambda: True)()
+        ):
+            self._playing = True
+        self._sync_consumer_registration()
+        self._update_tick()
 
     def _on_unmap(self, *_):
         self._active = False
-        if self._tick_id is not None:
-            GLib.source_remove(self._tick_id)
-            self._tick_id = None
+        # Re-evaluate the transport on the next map; otherwise a visualizer
+        # hidden while paused can remap with a stale ``_playing=True`` flag.
+        self._playing = False
+        self._sync_consumer_registration()
+        self._stop_tick()
         self._levels = []
         self._velocities = []
+
+    def set_active(self, active):
+        """Start the visualizer only while this view is actually playing.
+
+        The player also disables the GStreamer spectrum filter when the
+        preference is off.  Keeping the widget side lazy is important: a
+        hidden GTK view can remain mapped in a bottom sheet and otherwise
+        would keep a 60 FPS timeout alive forever.
+        """
+
+        self._playing = bool(active)
+        self._sync_consumer_registration()
+        if not self._playing:
+            self._stop_tick()
+            self._levels = []
+            self._velocities = []
+            self.queue_draw()
+        else:
+            self._update_tick()
+
+    def _on_destroy(self, *_):
+        self._active = False
+        self._playing = False
+        self._sync_consumer_registration()
+        self._stop_tick()
+
+    def _start_tick(self):
+        if self._tick_id is not None:
+            return
+        # 30 FPS is smooth for bars and cuts UI wakeups in half.  Low-power
+        # mode uses 20 FPS, which is still more than enough for this effect.
+        interval = 50 if getattr(self.player, "get_low_power_mode", lambda: False)() else 33
+        self._tick_id = GLib.timeout_add(interval, self._on_tick)
+
+    def _stop_tick(self):
+        if self._tick_id is not None:
+            try:
+                GLib.source_remove(self._tick_id)
+            except Exception:
+                pass
+            self._tick_id = None
+
+    def _update_tick(self):
+        if (
+            self._active
+            and self._playing
+            and self.get_visible()
+            and self.get_mapped()
+        ):
+            self._start_tick()
+        else:
+            self._stop_tick()
 
     # ─── Log-frequency band reduction ──────────────────────────────────────
 
@@ -279,7 +365,12 @@ class Visualizer(Gtk.DrawingArea):
     # ─── Frame tick: pull + gravity + redraw ───────────────────────────────
 
     def _on_tick(self):
-        if not self._active:
+        if (
+            not self._active
+            or not self._playing
+            or not self.get_visible()
+            or not self.get_mapped()
+        ):
             self._tick_id = None
             return False
 
@@ -297,6 +388,12 @@ class Visualizer(Gtk.DrawingArea):
             self._ingest_magnitudes(magnitudes)
 
         if not self._levels:
+            if (
+                not getattr(self.player, "get_visualizer_enabled", lambda: True)()
+                or not getattr(self.player, "has_visualizer_spectrum", lambda: True)()
+            ):
+                self._tick_id = None
+                return False
             return True
 
         gravity = self.GRAVITY

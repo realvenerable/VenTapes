@@ -1,4 +1,4 @@
-from gi.repository import Gtk, Adw, GObject, Gdk
+from gi.repository import Gtk, Adw, GObject, Gdk, GLib
 
 
 class PlayerBar(Gtk.Box):
@@ -246,7 +246,12 @@ class PlayerBar(Gtk.Box):
         # non-essential controls (timings, volume, queue) so the meta box
         # always has room for at least the title.
         self._last_responsive_width = -1
-        self.add_tick_callback(self._responsive_tick)
+        # Width changes are infrequent; a 4 Hz poll is enough and avoids a
+        # frame-clock callback running for the lifetime of every player bar.
+        self._responsive_timer_id = 0
+        self.connect("map", self._on_map)
+        self.connect("unmap", self._on_unmap)
+        self.connect("destroy", self._on_destroy)
 
     def set_queue_active(self, active):
         if self.queue_btn.get_active() != active:
@@ -254,6 +259,12 @@ class PlayerBar(Gtk.Box):
 
     def set_compact(self, compact):
         self.is_compact = compact
+        if compact and self._responsive_timer_id:
+            try:
+                GLib.source_remove(self._responsive_timer_id)
+            except Exception:
+                pass
+            self._responsive_timer_id = 0
         # _responsive_tick stands down while compact, so anything it folded
         # into the 3-dot popover at desktop widths would be stranded there
         # (the like button, most visibly). Reset the width memo too, or the
@@ -297,6 +308,15 @@ class PlayerBar(Gtk.Box):
             self.content_box.set_spacing(10)
             self.controls_box.set_spacing(10)
 
+        if (
+            not self.is_compact
+            and self.get_mapped()
+            and not self._responsive_timer_id
+        ):
+            self._responsive_timer_id = GLib.timeout_add(
+                250, self._responsive_tick
+            )
+
     def set_sheet_bar(self, enabled):
         """Tell the bar it is now AdwBottomSheet's bottom bar. The sheet
         opens on click and follows the finger on a pull up by itself, so
@@ -323,13 +343,14 @@ class PlayerBar(Gtk.Box):
             self.expand_btn.set_icon_name("go-up-symbolic")
             self.expand_btn.set_tooltip_text("Expand player")
 
-    def _responsive_tick(self, widget, frame_clock):
+    def _responsive_tick(self):
         """Move non-essential controls (like / queue / volume) into the 3-dot
         overflow popover as the bar narrows. Timings stay inline. Only kicks
         in when the bar is in desktop (non-compact) mode — set_compact owns
         the mobile layout independently."""
         if self.is_compact:
-            return True
+            self._responsive_timer_id = 0
+            return False
         width = self.get_width()
         if width <= 1 or width == self._last_responsive_width:
             return True
@@ -362,6 +383,30 @@ class PlayerBar(Gtk.Box):
     # the order they're appended in __init__ (volume → queue → like). Used to
     # re-inline them in the right place regardless of the order they happen to
     # come back in as the bar widens.
+    def _on_map(self, *_):
+        # Re-evaluate after a view is reparented even if its width did not
+        # change while it was hidden.
+        self._last_responsive_width = -1
+        self.on_state_changed(self.player, self.player.get_state_string())
+        if hasattr(self.player, "get_position_snapshot"):
+            pos, dur = self.player.get_position_snapshot()
+            self.on_progression(self.player, pos, dur)
+        if not self._responsive_timer_id:
+            self._responsive_timer_id = GLib.timeout_add(
+                250, self._responsive_tick
+            )
+
+    def _on_unmap(self, *_):
+        if self._responsive_timer_id:
+            try:
+                GLib.source_remove(self._responsive_timer_id)
+            except Exception:
+                pass
+            self._responsive_timer_id = 0
+
+    def _on_destroy(self, *_):
+        self._on_unmap()
+
     def _responsive_order(self):
         return [self.volume_container, self.queue_btn, self.like_btn]
 
@@ -628,6 +673,8 @@ class PlayerBar(Gtk.Box):
         return f"{m}:{s:02d}"
 
     def on_progression(self, player, pos, dur):
+        if not self.get_mapped():
+            return
         if getattr(self, "_scroll_seek_id", None):
             return
         self.scale.set_range(0, dur)

@@ -359,9 +359,9 @@ picture.song-img, .song-img, label.song-index {
        spans 0.19 and stays the accent from top to bottom. */
     background: linear-gradient(
       135deg,
-      mix(var(--accent-bg-color), white, 0.28) 0%,
-      var(--accent-bg-color) 50%,
-      mix(var(--accent-bg-color), black, 0.18) 100%
+      mix(@accent_bg_color, white, 0.28) 0%,
+      @accent_bg_color 50%,
+      mix(@accent_bg_color, black, 0.18) 100%
     );
     color: @accent_fg_color;
 }
@@ -407,6 +407,46 @@ listview.playlist-view > row:disabled {
 
 .queue-header {
   background-color: alpha(@window_bg_color, 0.4);
+}
+
+/* Low-power mode avoids repainting large surfaces for purely decorative
+   transitions.  It is intentionally a small class-level override rather
+   than a second stylesheet/provider. */
+window.low-power,
+window.low-power > windowhandle,
+window.low-power .player-bar,
+window.low-power .queue-panel,
+window.low-power .sidebar-pane,
+window.low-power .card,
+window.low-power .boxed-list,
+window.reduce-motion,
+window.reduce-motion > windowhandle,
+window.reduce-motion .player-bar,
+window.reduce-motion .queue-panel,
+window.reduce-motion .sidebar-pane,
+window.reduce-motion .card,
+window.reduce-motion .boxed-list,
+window.low-power .lyrics-line,
+window.low-power .lyrics-line-label,
+window.low-power .lyrics-line-sub,
+window.reduce-motion .lyrics-line,
+window.reduce-motion .lyrics-line-label,
+window.reduce-motion .lyrics-line-sub {
+  transition: none;
+}
+
+/* App-local high contrast complements the system's read-only setting.  The
+   derived color provider raises its text targets to AAA; these rules make
+   the distinction visible on controls that otherwise inherit Adwaita's
+   muted foreground. */
+window.high-contrast label.dim-label,
+window.high-contrast label.caption {
+  opacity: 1;
+}
+window.high-contrast button,
+window.high-contrast entry,
+window.high-contrast .spinbutton {
+  outline: 1px solid alpha(@window_fg_color, 0.55);
 }
 
 /* ── Home page ─────────────────────────────────────────────────────────── */
@@ -502,9 +542,9 @@ flowboxchild:focus-visible {
        spans 0.19 and stays the accent from top to bottom. */
     background: linear-gradient(
       135deg,
-      mix(var(--accent-bg-color), white, 0.28) 0%,
-      var(--accent-bg-color) 50%,
-      mix(var(--accent-bg-color), black, 0.18) 100%
+      mix(@accent_bg_color, white, 0.28) 0%,
+      @accent_bg_color 50%,
+      mix(@accent_bg_color, black, 0.18) 100%
     );
     color: @accent_fg_color;
     -gtk-icon-size: 72px;

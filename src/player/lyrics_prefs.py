@@ -18,15 +18,21 @@ A provider added in a later release isn't in the saved order, so
 :func:`provider_order` appends unknown-but-known-to-the-app names at the
 end rather than losing them.
 
-Reads are mtime-cached: the fetch chain asks for the order on every
-track change from a worker thread, and the widget asks per row build.
+Reads use the shared atomic preference store. The fetch chain asks for the
+order on every track change from a worker thread, and the widget asks per row
+build; merge-based writes keep those readers from losing one another's keys.
 """
 
-import json
 import os
 import threading
 
-from gi.repository import GLib
+from ui.preferences import (
+    get_bool,
+    get_float,
+    read_prefs,
+    update_prefs,
+    user_prefs_path,
+)
 
 
 # Canonical provider names, in the order the chain used before the queue
@@ -59,72 +65,92 @@ ACTIVE_SCALE_MIN, ACTIVE_SCALE_MAX, ACTIVE_SCALE_DEFAULT = 1.0, 1.3, 1.2
 _lock = threading.Lock()
 _cache = None
 _cache_mtime = -1.0
+_cache_stat_key = None
 
 
 def _path():
-    return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+    return user_prefs_path()
+
+
+def _stat_key(path):
+    try:
+        stat = os.stat(path)
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    except OSError:
+        return None
 
 
 def _read():
-    """Return the whole prefs dict, re-reading only when the file's
-    mtime moved. Preferences are written by the settings dialog on the
-    main thread and read from lyric fetch workers, hence the lock."""
-    global _cache, _cache_mtime
+    """Return a consistent prefs snapshot for lyric workers.
+
+    The shared preference store performs an atomic, merge-based write.  Keep
+    a small stat-keyed cache for row construction (the widget asks for the
+    same handful of settings repeatedly), while the inode/size/mtime key
+    still notices a cross-process atomic replacement even on filesystems
+    with coarse timestamps.
+    """
+    global _cache, _cache_mtime, _cache_stat_key
     path = _path()
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return {}
+    stat_key = _stat_key(path)
     with _lock:
-        if _cache is not None and mtime == _cache_mtime:
-            return _cache
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        _cache = data
-        _cache_mtime = mtime
-        return data
-
-
-def _write(key, value):
-    global _cache, _cache_mtime
-    path = _path()
-    data = {}
+        if _cache is not None and stat_key is not None and stat_key == _cache_stat_key:
+            return dict(_cache)
+    before_stat_key = _stat_key(path)
     try:
-        if os.path.exists(path):
-            with open(path) as f:
-                data = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
+        data = dict(read_prefs(path, {}))
+    except Exception as exc:
+        print(f"[LYRICS-PREFS] read failed: {exc}")
         data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data[key] = value
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(data, f)
-    except OSError as e:
-        print(f"[LYRICS-PREFS] write failed: {e}")
-        return
+        after_stat_key = None
+    else:
+        after_stat_key = _stat_key(path)
+    # Keep the key from the same read window.  Re-statting after taking the
+    # cache lock can associate an older snapshot with a newer file when
+    # another thread/process commits between those operations.  If the file
+    # changed while it was being read, leave the cache cold so the next
+    # caller retries rather than pinning a stale snapshot to the new key.
+    read_stat_key = (
+        after_stat_key
+        if before_stat_key is not None
+        and before_stat_key == after_stat_key
+        else None
+    )
     with _lock:
         _cache = data
+        _cache_stat_key = read_stat_key
         try:
             _cache_mtime = os.path.getmtime(path)
         except OSError:
             _cache_mtime = -1.0
+        return dict(data)
+
+
+def _write(key, value):
+    global _cache, _cache_mtime, _cache_stat_key
+    path = _path()
+    try:
+        update_prefs(path, {key: value})
+    except Exception as exc:
+        print(f"[LYRICS-PREFS] write failed: {exc}")
+        return
+    # Do not install the snapshot returned by update_prefs directly here.
+    # Another writer may commit before this thread reaches the lock; keeping
+    # a complete (but potentially older) dict would then masquerade as the
+    # newest file.  Invalidation is cheap and the next row build repopulates
+    # the cache with a stat-keyed read.
+    with _lock:
+        _cache = None
+        _cache_stat_key = None
+        _cache_mtime = -1.0
 
 
 def invalidate():
-    """Drop the mtime cache. Only needed when something outside this
-    module rewrites prefs.json in the same second the cache was filled."""
-    global _cache, _cache_mtime
+    """Drop the local stat cache after an external preference change."""
+    global _cache, _cache_mtime, _cache_stat_key
     with _lock:
         _cache = None
         _cache_mtime = -1.0
+        _cache_stat_key = None
 
 
 def full_provider_order():
@@ -137,7 +163,7 @@ def full_provider_order():
     known = set(DEFAULT_PROVIDER_ORDER)
     out = []
     for name in saved:
-        if name in known and name not in out:
+        if isinstance(name, str) and name in known and name not in out:
             out.append(name)
     for name in DEFAULT_PROVIDER_ORDER:
         if name not in out:
@@ -163,10 +189,18 @@ def provider_order():
 
 
 def set_provider_order(order):
-    _write("lyrics_provider_order", list(order))
+    if not isinstance(order, (list, tuple)):
+        order = []
+    known = set(DEFAULT_PROVIDER_ORDER)
+    _write(
+        "lyrics_provider_order",
+        [name for name in order if isinstance(name, str) and name in known],
+    )
 
 
 def set_provider_enabled(name, enabled):
+    if not isinstance(name, str) or name not in DEFAULT_PROVIDER_ORDER:
+        return
     disabled = disabled_providers()
     if enabled:
         disabled.discard(name)
@@ -181,6 +215,8 @@ def match_mode():
 
 
 def set_match_mode(mode):
+    if mode not in (MATCH_QUALITY, MATCH_STRICT):
+        mode = MATCH_QUALITY
     _write("lyrics_match_mode", mode)
 
 
@@ -199,8 +235,8 @@ def set_second_line_mode(mode):
 
 def ensure_second_line_mode():
     """Write the default out when the key is missing or unusable, so the
-    setting is never left implicit. Main thread only: _write is not safe
-    against the lyric workers that read this pref."""
+    setting is never left implicit. The shared preference store makes this
+    safe alongside lyric workers reading the same file."""
     val = _read().get("lyrics_second_line")
     if val not in SECOND_LINE_MODES:
         _write("lyrics_second_line", SECOND_LINE_DEFAULT)
@@ -210,7 +246,7 @@ def ensure_second_line_mode():
 def line_sweep():
     """Whether a line-synced source gets synthesized per-word timing so
     its highlight travels across the line."""
-    return bool(_read().get("lyrics_line_sweep", True))
+    return get_bool(_read(), "lyrics_line_sweep", True)
 
 
 def set_line_sweep(enabled):
@@ -218,11 +254,7 @@ def set_line_sweep(enabled):
 
 
 def _clamped_float(key, default, low, high):
-    try:
-        val = float(_read().get(key, default))
-    except (TypeError, ValueError):
-        return default
-    return max(low, min(high, val))
+    return get_float(_read(), key, default, low, high)
 
 
 def font_scale():

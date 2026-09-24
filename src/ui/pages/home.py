@@ -1,5 +1,6 @@
 import re
 import threading
+import weakref
 
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk
 
@@ -256,17 +257,24 @@ def _attach_item_playing_state(widget, player, video_id, is_button=True):
     if not video_id:
         return
 
+    weak_widget = weakref.ref(widget)
+    weak_player = weakref.ref(player)
+
     def update_state(*args):
-        current_id = getattr(player, "current_video_id", None)
+        target = weak_widget()
+        source = weak_player()
+        if target is None or source is None:
+            return False
+        current_id = getattr(source, "current_video_id", None)
         is_playing = bool(current_id and current_id == video_id)
         if is_playing:
-            widget.add_css_class("playing")
+            target.add_css_class("playing")
             if is_button:
-                widget.remove_css_class("flat")
+                target.remove_css_class("flat")
         else:
-            widget.remove_css_class("playing")
+            target.remove_css_class("playing")
             if is_button:
-                widget.add_css_class("flat")
+                target.add_css_class("flat")
 
     update_state()
     bind_weak_signal(player, "metadata-changed", widget, update_state)
@@ -383,7 +391,19 @@ class HomePage(Adw.Bin):
         self.set_child(self.stack)
         self.stack.set_visible_child_name("loading")
 
-        GLib.idle_add(self.load_home_data)
+        # Fetch the feed only when this tab is actually shown.  Constructing
+        # every top-level page at startup used to start three independent
+        # network/UI builds before the user had selected a tab.
+        self.connect("map", self._on_first_map)
+        self.connect("notify::visible", self._on_visibility_changed)
+
+    def _on_first_map(self, *_):
+        if not self._loaded and not self._loading:
+            self.load_home_data()
+
+    def _on_visibility_changed(self, *_):
+        if self.get_mapped() and not self._loaded and not self._loading:
+            self.load_home_data()
 
     # ─── Layout ────────────────────────────────────────────────────────────
 

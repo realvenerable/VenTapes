@@ -16,6 +16,7 @@ import threading
 import time
 import requests
 from gi.repository import GLib, GObject
+from ui.preferences import get_bool, read_prefs, update_prefs, user_prefs_path
 
 # Format config
 FORMATS = {
@@ -88,59 +89,49 @@ def _sanitize_filename(name):
 
 
 def _get_prefs():
-    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+    return read_prefs(user_prefs_path(), {})
+
+
+def _save_pref(key, value):
     try:
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def _save_prefs(prefs):
-    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(prefs, f)
+        update_prefs(user_prefs_path(), {key: value})
+        return True
+    except Exception as exc:
+        print(f"[DOWNLOADS] failed to save preference {key}: {exc}")
+        return False
 
 
 def get_preferred_format():
-    return _get_prefs().get("download_format", DEFAULT_FORMAT)
+    value = _get_prefs().get("download_format", DEFAULT_FORMAT)
+    return value if isinstance(value, str) and value in FORMATS else DEFAULT_FORMAT
 
 
 def set_preferred_format(fmt):
-    if fmt in FORMATS:
-        prefs = _get_prefs()
-        prefs["download_format"] = fmt
-        _save_prefs(prefs)
+    if isinstance(fmt, str) and fmt in FORMATS:
+        _save_pref("download_format", fmt)
 
 
 def get_folder_structure():
     val = _get_prefs().get("download_folder_structure", DEFAULT_FOLDER_STRUCTURE)
-    return val if val in FOLDER_STRUCTURES else DEFAULT_FOLDER_STRUCTURE
+    return val if isinstance(val, str) and val in FOLDER_STRUCTURES else DEFAULT_FOLDER_STRUCTURE
 
 
 def set_folder_structure(structure):
     """Returns True if the structure pref was actually changed."""
-    if structure not in FOLDER_STRUCTURES:
+    if not isinstance(structure, str) or structure not in FOLDER_STRUCTURES:
         return False
     prefs = _get_prefs()
     if prefs.get("download_folder_structure", DEFAULT_FOLDER_STRUCTURE) == structure:
         return False
-    prefs["download_folder_structure"] = structure
-    _save_prefs(prefs)
-    return True
+    return _save_pref("download_folder_structure", structure)
 
 
 def use_songs_subdir():
-    return _get_prefs().get("use_songs_subdir", False)
+    return get_bool(_get_prefs(), "use_songs_subdir", False)
 
 
 def set_use_songs_subdir(enabled: bool):
-    prefs = _get_prefs()
-    prefs["use_songs_subdir"] = bool(enabled)
-    _save_prefs(prefs)
+    _save_pref("use_songs_subdir", bool(enabled))
 
 
 def _build_download_dir(music_dir, artist_str, album, structure):

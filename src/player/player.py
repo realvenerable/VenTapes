@@ -8,6 +8,8 @@ import random
 import os
 import shutil
 import json
+import queue
+import time
 
 
 class _YdlLogger:
@@ -104,6 +106,23 @@ from yt_dlp import YoutubeDL
 from ui.utils import get_high_res_url, get_ytimg_fallbacks
 from player.cache import StreamCache
 from player.downloads import DownloadManager
+from player.staging import (
+    DEFAULT_STAGING_LIMIT_MB,
+    STAGING_DIR_PREFIX,
+    StagingCancelled,
+    StagingLimitExceeded,
+    acquire_staging_lease,
+    acquire_staging_lock,
+    directory_size,
+    find_completed_audio,
+    is_staging_dir,
+    limit_bytes_from_mb,
+    refresh_staging_lease,
+    remove_staging_dir,
+    reported_size_exceeds,
+    staging_lease_state,
+    sweep_staging_dirs,
+)
 from api.client import MusicClient
 
 HAS_MPRIS = False
@@ -123,6 +142,7 @@ else:
 
 from player.discord_rpc import DiscordRPCAdapter
 from player.scrobbler import ScrobblerAdapter
+from ui.preferences import get_bool, read_prefs, user_prefs_path
 
 
 def _extract_spectrum_bands(structure):
@@ -177,6 +197,40 @@ def _extract_spectrum_bands(structure):
     except Exception:
         raw = None
     return _walk(raw)
+
+
+def _is_manifest_protocol(protocol):
+    value = str(protocol or "").lower()
+    return (
+        "m3u8" in value
+        or "dash" in value
+        or "hls" in value
+        or "manifest" in value
+    )
+
+
+def _yt_dlp_final_filename(result):
+    """Best-effort extraction of yt-dlp's final output path."""
+
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (list, tuple)):
+        for item in reversed(result):
+            found = _yt_dlp_final_filename(item)
+            if found:
+                return found
+        return None
+    if not isinstance(result, dict):
+        return None
+    for key in ("filepath", "_filename", "filename"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("requested_downloads", "entries"):
+        found = _yt_dlp_final_filename(result.get(key))
+        if found:
+            return found
+    return None
 
 
 def _parse_track_duration(track):
@@ -248,36 +302,32 @@ class Player(GObject.Object):
         flags = self.player.get_property("flags")
         self.player.set_property("flags", flags & ~(1 << 0))
 
-        # Insert a passthrough spectrum analyzer between the decoder and the
-        # audio sink. The element emits ELEMENT bus messages with per-band
-        # magnitudes that the cover view's visualizer subscribes to. We pull
-        # plenty of raw bands (128) and let the UI reduce them to fewer
-        # display bars on a log scale, which gives a much more "alive" feel
-        # than a flat 32-band mapping (bass and treble each get their own
-        # display real estate instead of treble dominating).
-        self._visualizer_bands = 128
+        # The spectrum analyzer is deliberately optional.  It is an audio
+        # filter, so leaving it attached even when the bars are hidden makes
+        # every track pay for FFT work that cannot be seen.  The widget calls
+        # set_visualizer_enabled() when the preference changes, which also
+        # makes this work for users who enable it later without restarting.
+        prefs = read_prefs(user_prefs_path(), {})
+        self._low_power_mode = get_bool(prefs, "low_power_mode", False)
+        self._reduce_motion_pref_enabled = get_bool(
+            prefs, "reduce_motion", False
+        )
+        self._reduce_motion = (
+            self._reduce_motion_pref_enabled or self._low_power_mode
+        )
+        self._visualizer_pref_enabled = get_bool(
+            prefs, "visualizer_enabled", True
+        )
+        self._visualizer_enabled = self._visualizer_pref_enabled and not self._low_power_mode
+        self._visualizer_spectrum = None
+        self._visualizer_bands = 64
         self._visualizer_threshold_db = -80.0
-        # Position-keyed queue of (running_time_ns, bands) entries fed by
+        # Position-keyed queue of (stream_time_ns, bands) entries fed by
         # the spectrum bus message and drained by pull_visualizer_bands.
-        # Sized for ~3s of buffer at the spectrum element's 30Hz tick.
+        # Sized for ~3s of buffer at the spectrum element's 20Hz tick.
         from collections import deque
-        self._viz_queue = deque(maxlen=120)
-        spectrum = Gst.ElementFactory.make("spectrum", "visualizer-spectrum")
-        if spectrum is not None:
-            spectrum.set_property("post-messages", True)
-            spectrum.set_property("message-magnitude", True)
-            spectrum.set_property("message-phase", False)
-            spectrum.set_property("interval", 33_000_000)  # 33 ms / ~30 Hz
-            spectrum.set_property("bands", self._visualizer_bands)
-            spectrum.set_property("threshold", int(self._visualizer_threshold_db))
-            spectrum.set_property("multi-channel", False)
-            self.player.set_property("audio-filter", spectrum)
-            print("[VISUALIZER] spectrum element loaded — bars should animate")
-        else:
-            print(
-                "[VISUALIZER] spectrum element NOT available "
-                "(missing gst-plugins-good in this runtime) — bars will be inert"
-            )
+        self._viz_queue = deque(maxlen=64)
+        self._visualizer_active_keys = set()
 
         # Inject auth cookies + User-Agent into the HTTP source on every
         # source-setup. Helps for non-upload streams that need cookies on
@@ -288,8 +338,18 @@ class Player(GObject.Object):
         # Deleted when a new track loads or the app shuts down so we don't
         # leak hundreds of MB into RAM across a long session.
         self._current_tmpfs_path = None
-        import atexit
-        atexit.register(self._cleanup_all_tmpfs)
+        # A local fallback remains open until the serialized pipeline worker
+        # has actually reached NULL.  Removing it earlier can unlink the file
+        # underneath a still-playing GStreamer source.
+        self._pending_tmpfs_cleanups = []
+        self._staging_paths = set()
+        # A completed file is leased until the GTK thread adopts it (or
+        # cleanup explicitly releases it).  Keep ready paths separate from
+        # active download jobs so shutdown cannot mistake the handoff window
+        # for abandoned work.
+        self._staging_leases = {}
+        self._staging_ready_paths = {}
+        self._staging_budget_lock_path = None
 
         # Videos whose stream can't be seeked (e.g. YouTube only offers a
         # progressive m4a whose container has no usable seek index, so
@@ -302,8 +362,11 @@ class Player(GObject.Object):
         # Position to apply once a (re)loaded stream finishes prerolling —
         # set by the seek-fallback so we resume where the user aimed.
         self._seek_after_load = None
+        self._pending_seek = None
         # Guards against firing multiple tmpfs downloads for one failed seek.
         self._seek_fallback_active = False
+        self._seek_fallback_generation = None
+        self._pending_seek_fallback = None
 
         self.ydl_opts = {
             "js_runtimes": {"node": {}},
@@ -374,7 +437,7 @@ class Player(GObject.Object):
 
         self.bus = self.player.get_bus()
         self.bus.add_signal_watch()
-        self.bus.connect("message", self.on_message)
+        self._bus_handler_id = self.bus.connect("message", self.on_message)
 
         # Gapless playback: about-to-finish fires when the current uri is
         # close to ending. If we hand playbin a new uri synchronously in
@@ -383,6 +446,7 @@ class Player(GObject.Object):
         # listening where tracks are mastered to flow together.
         self.player.connect("about-to-finish", self._on_about_to_finish)
         self._pending_gapless_index = None  # set by about-to-finish, cleared by stream-start
+        self._pending_gapless_generation = None
 
         # Listen for external volume changes (system mixer)
         self.player.connect("notify::volume", self._on_external_volume_change)
@@ -392,6 +456,7 @@ class Player(GObject.Object):
         self._track_started_at = 0.0
 
         self.current_video_id = None
+        self._current_source_video_id = None
 
         # Queue State
         self.queue = []  # List of dicts: {id, title, artist, thumb, ...}
@@ -399,6 +464,11 @@ class Player(GObject.Object):
         self.shuffle_mode = False
         self.original_queue = []  # Backup for un-shuffle
         self.load_generation = 0  # To handle race conditions in loading
+        # Coordinates generation invalidation with the GStreamer
+        # about-to-finish callback.  The callback may briefly hand playbin a
+        # URI, but stop/load must be able to invalidate that plan atomically
+        # before it can be applied on the main thread.
+        self._generation_lock = threading.RLock()
         self.mpris_art_url = None
         self.current_url = None
         # Diagnostics for the "Stream Info (Debug)" panel. Filled at
@@ -407,6 +477,7 @@ class Player(GObject.Object):
         self._stream_debug = {}
         self._source_factory_name = None
         self._current_play_uri = None
+        self._current_play_uri_generation = None
         self.last_seek_time = 0.0
         self.duration = -1
         self._is_loading = False
@@ -437,10 +508,12 @@ class Player(GObject.Object):
         self.download_manager = DownloadManager(self.client)
         self._playing_from_cache = False
         self._pending_stream_url = None
+        self._pending_stream_cache = None
 
-        # Timer for progress
-        GObject.timeout_add(100, self.update_position)
-
+        # The progress timer is started when a track is loaded and stopped
+        # when the pipeline is idle.  A permanent 100 ms wake-up was pure
+        # background CPU when the app was stopped or only browsing music.
+        # (The actual interval is configured in _load_internal/state events.)
         # boolean checker if media api (MPRIS or SMTC) is loaded
         self.media_api_loaded = False
 
@@ -462,6 +535,205 @@ class Player(GObject.Object):
         except Exception as e:
             print(f"Scrobbler init failed: {e}")
             self.scrobbler = None
+
+        # All pipeline state changes are serialized through one worker.  The
+        # old code started a fresh thread for each NULL transition and each
+        # URI handoff; a late NULL from the previous track could therefore
+        # win the race after the new track reached PLAYING.  The queue keeps
+        # transitions ordered and lets us coalesce rapid skip/load bursts.
+        self._pipeline_commands = queue.Queue()
+        self._pipeline_worker = None
+        self._pipeline_worker_lock = threading.Lock()
+        self._pipeline_lock = threading.RLock()
+        self._pipeline_generation = None
+        self._stream_started_generation = None
+        self._pipeline_started_at = 0.0
+        self._source_generation_lock = threading.Lock()
+        self._source_generations = {}
+        self._last_source_id = None
+        self._last_source_key = None
+        self._pipeline_shutdown = False
+        self._pipeline_shutdown_sentinel = threading.Event()
+        self._pipeline_null_confirmed = threading.Event()
+        self._staging_lock = threading.Lock()
+        self._staging_jobs = {}
+        self._staging_active = False
+        # Staging is deliberately bounded.  A bad/live stream must not be
+        # able to fill /dev/shm (or the disk fallback) while the user skips
+        # through a queue.  Deployments can lower the cap without changing
+        # code; the UI still falls back to ordinary streaming when the cap is
+        # reached.
+        self._staging_limit_bytes = limit_bytes_from_mb(
+            os.environ.get("VENTAPES_STAGING_MAX_MB", DEFAULT_STAGING_LIMIT_MB)
+        )
+        self._position_timer_id = 0
+        self._progress_interval_ms = 500 if self._low_power_mode else 250
+        self._buffering_since = 0.0
+        self._last_progress_at = 0.0
+        self._last_progress_position = 0.0
+        self._stall_recovery_active = False
+        self._last_emitted_position = -1.0
+        self._last_emitted_duration = -1.0
+        self._last_position_seconds = 0.0
+        self._last_duration_seconds = 0.0
+        self._next_duration_probe = 0.0
+        self._precache_enabled = get_bool(
+            prefs, "precache_next", True
+        ) and not self._low_power_mode
+        self._precache_lock = threading.Lock()
+        self._precache_epoch = 0
+        self._precache_cancel = threading.Event()
+        self._precache_downloaders = set()
+
+        # Register only after all cleanup state exists; a failed constructor
+        # must not leave an atexit hook that dereferences half-built fields.
+        import atexit
+        atexit.register(self._cleanup_all_tmpfs)
+        # Reclaim dead owners from an earlier process during construction.
+        # New leases make this safe even for recently-created directories;
+        # legacy directories still use the age grace period.
+        try:
+            self._sweep_staging_roots()
+        except Exception:
+            pass
+
+    def _enable_spectrum(self):
+        """Attach the lightweight spectrum filter when the UI needs it."""
+
+        if self._visualizer_spectrum is not None:
+            return
+        spectrum = Gst.ElementFactory.make("spectrum", "visualizer-spectrum")
+        if spectrum is None:
+            print(
+                "[VISUALIZER] spectrum element NOT available "
+                "(missing gst-plugins-good in this runtime) — bars will be inert"
+            )
+            return
+        try:
+            spectrum.set_property("post-messages", True)
+            spectrum.set_property("message-magnitude", True)
+            spectrum.set_property("message-phase", False)
+            # 20 Hz is enough for a 30 FPS bar display and is much cheaper
+            # than the old 30 Hz FFT on low-power CPUs.
+            spectrum.set_property("interval", 50_000_000)
+            spectrum.set_property("bands", self._visualizer_bands)
+            spectrum.set_property("threshold", int(self._visualizer_threshold_db))
+            spectrum.set_property("multi-channel", False)
+            self.player.set_property("audio-filter", spectrum)
+            self._visualizer_spectrum = spectrum
+            print("[VISUALIZER] spectrum element loaded — bars should animate")
+        except Exception as exc:
+            print(f"[VISUALIZER] spectrum setup failed: {exc}")
+
+    def _disable_spectrum(self):
+        spectrum = self._visualizer_spectrum
+        if spectrum is None:
+            return
+        try:
+            self.player.set_property("audio-filter", None)
+        except Exception:
+            pass
+        self._visualizer_spectrum = None
+        self._viz_queue.clear()
+
+    def set_visualizer_active(self, consumer, active):
+        """Track visible visualizer consumers before attaching the FFT."""
+
+        key = id(consumer)
+        if active:
+            self._visualizer_active_keys.add(key)
+        else:
+            self._visualizer_active_keys.discard(key)
+        should_run = bool(self._visualizer_active_keys) and self._visualizer_enabled
+        if should_run and self._visualizer_spectrum is None:
+            self._enable_spectrum()
+        elif not should_run and self._visualizer_spectrum is not None:
+            self._disable_spectrum()
+
+    def set_visualizer_enabled(self, enabled):
+        self._visualizer_pref_enabled = bool(enabled)
+        enabled = self._visualizer_pref_enabled and not self._low_power_mode
+        changed = enabled != self._visualizer_enabled
+        self._visualizer_enabled = enabled
+        if enabled and self._visualizer_active_keys:
+            self._enable_spectrum()
+        elif not enabled:
+            self._disable_spectrum()
+        elif changed:
+            self._enable_spectrum()
+
+    def get_visualizer_enabled(self):
+        return bool(self._visualizer_enabled)
+
+    def has_visualizer_spectrum(self):
+        return self._visualizer_spectrum is not None
+
+    def set_low_power_mode(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self._low_power_mode:
+            return
+        self._low_power_mode = enabled
+        self._reduce_motion = (
+            self._reduce_motion_pref_enabled or self._low_power_mode
+        )
+        self._cancel_staging_jobs("power mode changed")
+        self.set_visualizer_enabled(self._visualizer_pref_enabled)
+        self._progress_interval_ms = 500 if enabled else 250
+        if hasattr(self, "_position_timer_id"):
+            self._restart_position_timer()
+        if enabled:
+            self._precache_enabled = False
+            self._cancel_precache("low-power enabled")
+        else:
+            prefs = read_prefs(user_prefs_path(), {})
+            self._precache_enabled = get_bool(prefs, "precache_next", True)
+
+    def get_low_power_mode(self):
+        return bool(self._low_power_mode)
+
+    def set_reduce_motion(self, enabled):
+        self._reduce_motion_pref_enabled = bool(enabled)
+        self._reduce_motion = (
+            self._reduce_motion_pref_enabled or self._low_power_mode
+        )
+
+    def get_reduce_motion(self):
+        return bool(self._reduce_motion)
+
+    def _cancel_precache(self, reason="cancelled"):
+        with self._precache_lock:
+            self._precache_epoch += 1
+            cancel = self._precache_cancel
+            self._precache_cancel = threading.Event()
+            downloaders = list(self._precache_downloaders)
+        cancel.set()
+        for downloader in downloaders:
+            try:
+                close = getattr(downloader, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+
+    def _precache_still_current(self, epoch, cancel):
+        return (
+            not cancel.is_set()
+            and self._precache_enabled
+            and epoch == self._precache_epoch
+        )
+
+    def set_precache_enabled(self, enabled):
+        new_value = bool(enabled) and not self._low_power_mode
+        if new_value == self._precache_enabled:
+            if not new_value:
+                self._cancel_precache("pre-cache disabled")
+            return
+        self._precache_enabled = new_value
+        if not new_value:
+            self._cancel_precache("pre-cache disabled")
+
+    def get_precache_enabled(self):
+        return bool(self._precache_enabled)
 
     def _load_media_api(self):
         "Starts MPRIS or SMTC for Linux or Windows, loads once only when _start_playback is called"
@@ -680,13 +952,14 @@ class Player(GObject.Object):
         Sets the global queue and plays the track at start_index.
         tracks: list of dicts with videoId, title, artist, thumb
         """
-        import traceback as _tb
-        _caller = "".join(_tb.format_stack(limit=4)[:-1])
-        print(
-            f"[JUMP-TRACE] set_queue n={len(tracks)} start_index={start_index}"
-            f" shuffle={shuffle} source_id={source_id}\nCALLER:\n{_caller}",
-            flush=True,
-        )
+        if os.environ.get("VENTAPES_TRACE") == "1":
+            import traceback as _tb
+            _caller = "".join(_tb.format_stack(limit=4)[:-1])
+            print(
+                f"[JUMP-TRACE] set_queue n={len(tracks)} start_index={start_index}"
+                f" shuffle={shuffle} source_id={source_id}\nCALLER:\n{_caller}",
+                flush=True,
+            )
         self.stop()
         self.queue = list(tracks)  # Copy for playing
         self.original_queue = list(tracks)  # Backup for un-shuffle
@@ -814,7 +1087,10 @@ class Player(GObject.Object):
         # sees the new generation and aborts. Without this, clicking
         # Clear while a track was loading would let the resolution
         # finish and start playback into an empty queue.
-        self.load_generation += 1
+        with self._generation_lock:
+            self.load_generation += 1
+        self._cancel_staging_jobs("queue cleared")
+        self._cancel_precache("queue cleared")
         self.queue = []
         self.original_queue = []
         self.current_queue_index = -1
@@ -824,13 +1100,14 @@ class Player(GObject.Object):
         self.emit("metadata-changed", "", "", "", "", "INDIFFERENT")
 
     def play_queue_index(self, index):
-        import traceback as _tb
-        _caller = "".join(_tb.format_stack(limit=4)[:-1])
-        print(
-            f"[JUMP-TRACE] play_queue_index({index}) queue_len={len(self.queue)}"
-            f" current_idx={self.current_queue_index}\nCALLER:\n{_caller}",
-            flush=True,
-        )
+        if os.environ.get("VENTAPES_TRACE") == "1":
+            import traceback as _tb
+            _caller = "".join(_tb.format_stack(limit=4)[:-1])
+            print(
+                f"[JUMP-TRACE] play_queue_index({index}) queue_len={len(self.queue)}"
+                f" current_idx={self.current_queue_index}\nCALLER:\n{_caller}",
+                flush=True,
+            )
         if 0 <= index < len(self.queue):
             self.stop()
             self.current_queue_index = index
@@ -883,11 +1160,9 @@ class Player(GObject.Object):
 
     def _on_about_to_finish(self, _playbin):
         """Runs on the GStreamer streaming thread. Must complete fast —
-        playbin uses whatever uri is set when this returns. yt-dlp
-        resolution is too slow to fit here, so we only enable gapless
-        when the next track's URL is already cached (file:// for
-        downloads, the StreamCache for streams). Upload tracks (tmpfs
-        path) are skipped — they need their own pre-buffering."""
+        playbin uses whatever URI is set when this returns. Only verified
+        local files take this path; remote URLs go through the serialized
+        loader on EOS so a stalled signed URL cannot bypass recovery."""
         nxt = self._compute_next_gapless_index()
         if nxt is None or nxt >= len(self.queue):
             return
@@ -904,41 +1179,107 @@ class Player(GObject.Object):
         if not vid:
             return
 
-        # Prefer a downloaded local copy (always works, offline-safe).
+        # Only local files take the gapless fast path. A cached remote URL
+        # can be a stale/manifest URL that stalls before its first buffer;
+        # assigning it directly here bypassed the serialized loader and was
+        # able to leave the next track silent until a seek. EOS will use the
+        # normal generation-aware load path for remote sources.
+        if vid in self._noseek_vids:
+            return
         local_path = self.download_manager.get_local_path(vid)
-        if local_path:
-            try:
-                uri = GLib.filename_to_uri(os.path.abspath(local_path), None)
-            except Exception:
-                uri = None
-        else:
-            uri = self.stream_cache.get(vid)
-
+        if not local_path:
+            return
+        try:
+            uri = GLib.filename_to_uri(os.path.abspath(local_path), None)
+        except Exception:
+            uri = None
         if not uri:
-            # No cached URL → no gapless this time. EOS will fire and
-            # _load_internal will resolve via yt-dlp the normal way.
             return
 
+        # about-to-finish runs on GStreamer's streaming thread.  It must not
+        # race a normal URI/state transaction; if the worker is busy, decline
+        # the fast path and let EOS use the serialized loader instead.
+        with self._generation_lock:
+            generation = self.load_generation
+        if self._pipeline_shutdown:
+            return
+        if not self._pipeline_lock.acquire(blocking=False):
+            return
         try:
-            self.player.set_property("uri", uri)
-            self._pending_gapless_index = nxt
-            print(
-                f"[GAPLESS] queued next uri for index={nxt} vid={vid} "
-                f"({'local' if local_path else 'cached'})"
-            )
+            # Stop/load invalidates the generation under the same lock.  Keep
+            # this check and the pending assignment together so a stop cannot
+            # clear the index and then have this callback restore it.
+            with self._generation_lock:
+                if (
+                    self._pipeline_shutdown
+                    or generation != self.load_generation
+                ):
+                    return
+                self._stream_started_generation = None
+                self._pipeline_started_at = time.monotonic()
+                self.player.set_property("uri", uri)
+                # Gapless bypasses _start_playback(), so keep the recovery/play
+                # path's notion of the active URI in sync with playbin.
+                self._current_play_uri = uri
+                self._current_play_uri_generation = generation
+                self._pending_gapless_index = nxt
+                self._pending_gapless_generation = generation
+                print(
+                    f"[GAPLESS] queued next uri for index={nxt} vid={vid} "
+                    f"({'local' if local_path else 'unknown'})"
+                )
         except Exception as e:
             print(f"[GAPLESS] failed to set next uri: {e}")
             self._pending_gapless_index = None
+            self._pending_gapless_generation = None
+        finally:
+            self._pipeline_lock.release()
 
-    def _apply_gapless_transition(self):
+    def _apply_gapless_transition(self, expected_generation=None):
         """Main-thread finisher for a gapless track swap. Mirrors the
         post-load housekeeping in _load_internal — queue index, history,
         metadata signal, MPRIS, precache — but skips everything pipeline-
         related since playbin already handed the new uri off."""
         nxt = self._pending_gapless_index
+        pending_generation = self._pending_gapless_generation
         self._pending_gapless_index = None
-        if nxt is None or nxt < 0 or nxt >= len(self.queue):
-            return False
+        self._pending_gapless_generation = None
+        with self._generation_lock:
+            if (
+                self._pipeline_shutdown
+                or pending_generation is None
+                or (
+                    expected_generation is not None
+                    and pending_generation != expected_generation
+                )
+                or pending_generation != self.load_generation
+                or nxt is None
+                or nxt < 0
+                or nxt >= len(self.queue)
+            ):
+                return False
+            current_gen = self.load_generation + 1
+            self.load_generation = current_gen
+            self._pipeline_generation = current_gen
+            self._stream_started_generation = current_gen
+            self._current_play_uri_generation = current_gen
+            self._pipeline_null_confirmed.clear()
+            # Gapless playback has no fresh STATE_CHANGED(PLAYING) edge.
+            # Start the stale-EOS guard at the URI handoff so a late EOS from
+            # the old source is still rejected.
+            self._track_started_at = time.time()
+            self._buffering_since = 0.0
+            self._last_progress_at = 0.0
+            self._last_progress_position = 0
+            self._last_position_seconds = 0.0
+            self._last_duration_seconds = 0.0
+            self._next_duration_probe = 0.0
+            self._used_cached_url = False
+            self._fallback_stream_url = None
+            self._cache_failed_waiting = False
+            self._pending_stream_cache = None
+            self._stream_retry_count = 0
+            self._stall_recovery_active = False
 
         self.current_queue_index = nxt
         track = self.queue[nxt]
@@ -972,20 +1313,27 @@ class Player(GObject.Object):
             except Exception as e:
                 print(f"[HISTORY] gapless immediate record failed: {e}")
 
-        # Drop the previous track's tmpfs buffer (only used by upload
-        # tracks, which we skipped — but cheap to clear anyway).
+        # A gapless local transition has no NULL phase; keep the old file
+        # until the next serialized stop/play transaction can release it.
         if self._current_tmpfs_path:
-            self._cleanup_tmpfs_path(self._current_tmpfs_path)
-            self._current_tmpfs_path = None
+            self._defer_tmpfs_cleanup(self._current_tmpfs_path)
 
-        self.load_generation += 1
-        current_gen = self.load_generation
+        self._cancel_staging_jobs("gapless transition")
+        self._cancel_precache("gapless transition")
+        with self._source_generation_lock:
+            if self._last_source_id is not None:
+                self._source_generations[self._last_source_id] = current_gen
+            if self._last_source_key is not None:
+                try:
+                    self._source_generations[self._last_source_key] = current_gen
+                except (TypeError, AttributeError):
+                    pass
 
         self.emit(
             "metadata-changed",
             title, artist, thumb, video_id, like_status,
         )
-        if thumb:
+        if thumb and hasattr(self, "mpris_events"):
             self._sync_mpris_art(thumb, video_id)
         self._update_logical_state()
         if hasattr(self, "mpris_events"):
@@ -995,12 +1343,13 @@ class Player(GObject.Object):
                 print(f"mpris ERROR: {e}")
 
         # Top up the cache for whatever comes after this newly-current track.
-        threading.Thread(
-            target=self._precache_next,
-            args=(current_gen,),
-            kwargs={"max_count": 1},
-            daemon=True,
-        ).start()
+        if self._precache_enabled:
+            threading.Thread(
+                target=self._precache_next,
+                args=(current_gen,),
+                kwargs={"max_count": 1},
+                daemon=True,
+            ).start()
         return False
 
     def _maybe_extend_infinite(self):
@@ -1099,9 +1448,7 @@ class Player(GObject.Object):
         try:
             pos = self.player.query_position(Gst.Format.TIME)[1]
             if pos > 5 * Gst.SECOND:
-                self.player.seek_simple(
-                    Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
-                )
+                self.seek(0)
                 return
         except:
             pass
@@ -1110,10 +1457,9 @@ class Player(GObject.Object):
             self.current_queue_index -= 1
             self._play_current_index()
         else:
-            # Restart current if at 0
-            self.player.seek_simple(
-                Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0
-            )
+            # Restart current if at 0 through the same guarded path used by
+            # the seek bar, including the non-seekable-source fallback.
+            self.seek(0)
 
     def shuffle_queue(self):
         if not self.shuffle_mode:
@@ -1223,43 +1569,64 @@ class Player(GObject.Object):
         # after the player swaps to the audio version.
         self._current_source_video_id = video_id
 
+        # Claim the load generation before any idle callback or worker can
+        # publish metadata.  Every asynchronous completion carries this
+        # token and is ignored once a newer track has claimed the pipeline.
+        with self._generation_lock:
+            previous_generation = self.load_generation
+            self.load_generation += 1
+            current_gen = self.load_generation
+            self._pending_gapless_index = None
+            self._pending_gapless_generation = None
+        self._pipeline_generation = None
+        self._stream_started_generation = None
+        self._pipeline_started_at = 0.0
+        self._pipeline_null_confirmed.clear()
+        self._cancel_staging_jobs("new track")
+        self._cancel_precache("new track")
+        # Do not let play() mistake the previous track's URI for this new
+        # generation while yt-dlp/staging is still resolving it.
+        self._current_play_uri = None
+        self._current_play_uri_generation = None
         self._is_loading = True
+        self._current_logical_state = "loading"
+        self.emit("state-changed", "loading")
+        self._start_position_timer()
         # The new stream restarts running-time, so anything still queued
         # from the previous track is now nonsense — drop it before the
         # next visualizer tick pulls.
         self._viz_queue.clear()
-        # Any in-flight gapless plan is now superseded by this manual
-        # load — the user (or our own next() / repeat path) is taking
-        # control of the pipeline. Don't let a late stream-start apply
-        # the obsolete index.
-        self._pending_gapless_index = None
+        # Any in-flight gapless plan was invalidated with the generation
+        # claim above. Don't let a late stream-start apply the obsolete index.
         # A new track invalidates any parked seek-fallback target.
         self._seek_after_load = None
-        # set_state(NULL) blocks until the pipeline flushes buffers and
-        # closes any open HTTP sockets — measured at ~800ms occasionally
-        # when the previous track was streaming. Running it on the main
-        # thread froze the UI on every skip. GStreamer state changes are
-        # documented thread-safe, so push it to a worker; _start_playback
-        # serializes against it via the same pipeline's internal lock and
-        # _is_loading already gates anyone reading pipeline state.
-        try:
-            threading.Thread(
-                target=self.player.set_state,
-                args=(Gst.State.NULL,),
-                daemon=True,
-            ).start()
-        except Exception as e:
-            print(f"set_state ERROR: {e}")
-
-        # Drop the previous track's tmpfs buffer (if any) — by this point
-        # the pipeline has released the file. We do this before setting the
-        # new video_id so a fast track-change can't leave the buffer behind.
+        self._pending_seek = None
+        # The pipeline worker performs the NULL → URI → PLAYING sequence in
+        # order.  Keeping the transition here would reintroduce the old
+        # race with a late NULL transition from the previous track.
+        # Keep the previous local fallback until the serialized pipeline
+        # worker reaches NULL; a fast track change must not unlink a file
+        # that playbin is still reading.
         if self._current_tmpfs_path:
-            self._cleanup_tmpfs_path(self._current_tmpfs_path)
-            self._current_tmpfs_path = None
+            self._defer_tmpfs_cleanup(self._current_tmpfs_path)
 
+        # Flush the old source immediately instead of leaving it audible
+        # while URL resolution/staging runs in the background.  Mark the
+        # command with the *previous* generation so its bookkeeping cannot
+        # clear the seek/fallback state belonging to this new load.
+        self._queue_pipeline_command("stop", previous_generation)
         self.current_video_id = video_id
         self.duration = -1
+        self._last_emitted_position = -1.0
+        self._last_emitted_duration = -1.0
+        self._last_position_seconds = 0.0
+        self._last_duration_seconds = 0.0
+        self._next_duration_probe = 0.0
+        self._buffering_since = 0.0
+        self._last_progress_at = 0.0
+        self._last_progress_position = 0
+        self.last_seek_time = 0.0
+        self._track_started_at = 0.0
         self.emit("progression", 0.0, 0.0)
         self._notify_scrobbler(
             video_id,
@@ -1285,12 +1652,9 @@ class Player(GObject.Object):
             except Exception as e:
                 print(f"[HISTORY] immediate record failed: {e}")
 
-        self.load_generation += 1
-        current_gen = self.load_generation
-
         GLib.idle_add(
-            self.emit,
-            "metadata-changed",
+            self._emit_metadata_if_current,
+            current_gen,
             str(title),
             str(artist),
             str(thumbnail_url if thumbnail_url else ""),
@@ -1299,7 +1663,7 @@ class Player(GObject.Object):
         )
 
         # Trigger MPRIS art sync in background
-        if thumbnail_url:
+        if thumbnail_url and hasattr(self, "mpris_events"):
             self._sync_mpris_art(thumbnail_url, video_id)
 
         GLib.idle_add(self._update_logical_state)
@@ -1321,7 +1685,7 @@ class Player(GObject.Object):
                 "video_id": video_id,
                 "path": local_path,
             }
-            GLib.idle_add(self._start_playback, file_uri)
+            GLib.idle_add(self._start_playback, file_uri, current_gen)
             return
 
         # Check stream URL cache - skip yt-dlp if we have a valid cached URL
@@ -1331,6 +1695,7 @@ class Player(GObject.Object):
         self._swap_seek_target = None
         self._used_cached_url = False
         self._fallback_stream_url = None
+        self._pending_stream_cache = None
         self._cache_failed_waiting = False
         # Per-track retry counter. If a URL 503s mid-play we re-resolve
         # via yt-dlp (up to this many times) — googlevideo CDNs rotate
@@ -1374,7 +1739,7 @@ class Player(GObject.Object):
                     "source": "stream (cached URL)",
                     "video_id": video_id,
                 }
-                GLib.idle_add(self._start_playback, cached_url)
+                GLib.idle_add(self._start_playback, cached_url, current_gen)
 
         thread = threading.Thread(
             target=self._fetch_and_play,
@@ -1391,12 +1756,13 @@ class Player(GObject.Object):
         # remaining neighbours are still pre-cached, but only after the
         # current track's _fetch_and_play completes (see the trailing
         # _precache_next call inside that method).
-        threading.Thread(
-            target=self._precache_next,
-            args=(current_gen,),
-            kwargs={"max_count": 1},
-            daemon=True,
-        ).start()
+        if self._precache_enabled:
+            threading.Thread(
+                target=self._precache_next,
+                args=(current_gen,),
+                kwargs={"max_count": 1},
+                daemon=True,
+            ).start()
 
     def extend_queue(self, tracks):
         """Appends new tracks to the queue (and original_queue)."""
@@ -1604,114 +1970,735 @@ class Player(GObject.Object):
 
         return path
 
-    def _tmpfs_root(self):
-        """Pick a RAM-backed directory for upload buffers. /dev/shm is a
-        tmpfs on every modern Linux distro; /tmp is sometimes tmpfs and
-        sometimes not. Falls back to the platform tempdir if neither
-        works."""
+    def _tmpfs_root(self, low_power=None):
+        """Pick storage for seek fallback buffers.
+
+        Normal mode uses /dev/shm for fast local playback.  Low-power mode
+        deliberately uses the disk cache instead: a few hundred MB of
+        upload-locker audio must not count as application RAM on a small
+        device.  The directory name is unchanged so cleanup remains safe.
+        ``low_power`` is optional so shutdown can sweep both storage roots
+        even after the effective mode has changed.
+        """
         import tempfile
-        for candidate in ("/dev/shm", "/run/user/{}".format(os.getuid())):
+
+        if low_power is None:
+            low_power = self._low_power_mode
+        if low_power:
+            disk_root = os.path.join(
+                GLib.get_user_cache_dir(), "ventapes", "stream-fallback"
+            )
+            try:
+                os.makedirs(disk_root, exist_ok=True)
+                return disk_root
+            except OSError:
+                pass
+
+        candidates = ["/dev/shm"]
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None:
+            try:
+                candidates.append("/run/user/{}".format(getuid()))
+            except (OSError, TypeError, ValueError):
+                pass
+        for candidate in candidates:
             if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
                 return candidate
         return tempfile.gettempdir()
 
-    def _download_upload_to_tmpfs(self, video_id, generation):
-        """Pull an upload track into a tmpfs file via yt-dlp. Returns the
-        local file path on success, None otherwise. Blocks the calling
-        worker thread until the download is complete — typical upload is
-        a few MB so this finishes in <2s on a normal connection. The
-        caller is responsible for tracking the path so we can delete it
-        on track change.
+    def _staging_roots(self):
+        """Return both possible staging roots, de-duplicated by real path."""
 
-        Bails early if the user skipped to a different track mid-download
-        (load_generation changes invalidate the result)."""
+        roots = []
+        seen = set()
+        for low_power in (False, True):
+            try:
+                root = self._tmpfs_root(low_power=low_power)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            real = os.path.realpath(os.path.abspath(root))
+            if real not in seen:
+                seen.add(real)
+                roots.append(root)
+        return roots
+
+    def _get_staging_budget_lock_path(self):
+        """Return the cross-process lock guarding aggregate reservations."""
+
+        if self._staging_budget_lock_path:
+            return self._staging_budget_lock_path
+        try:
+            base = GLib.get_user_cache_dir()
+        except Exception:
+            base = None
+        if not base:
+            base = os.path.join(os.path.expanduser("~"), ".cache")
+        self._staging_budget_lock_path = os.path.join(
+            base, "ventapes", "staging-budget.lock"
+        )
+        return self._staging_budget_lock_path
+
+    def _staging_keep_paths(self):
+        """Paths that a stale-directory sweep must not remove."""
+
+        keep = []
+        with self._staging_lock:
+            for job in self._staging_jobs.values():
+                if job.get("path"):
+                    keep.append(job["path"])
+            keep.extend(self._pending_tmpfs_cleanups)
+            keep.extend(self._staging_paths)
+            keep.extend(self._staging_ready_paths)
+            current = self._current_tmpfs_path
+        if current:
+            keep.append(os.path.dirname(current))
+        return keep
+
+    def _sweep_staging_roots(self):
+        """Remove abandoned staging directories from RAM and disk roots."""
+
+        keep = self._staging_keep_paths()
+        removed = 0
+        for root in self._staging_roots():
+            removed += sweep_staging_dirs(root, keep=keep)
+        return removed
+
+    def _staging_used_bytes(self):
+        """Return bytes currently occupied by our staging directories."""
+
+        total = 0
+        for root in self._staging_roots():
+            try:
+                entries = list(os.scandir(root))
+            except OSError:
+                continue
+            for entry in entries:
+                if is_staging_dir(entry.path, (root,)):
+                    total += directory_size(entry.path)
+        return total
+
+    def _staging_cancelled(self, job):
+        if self._pipeline_shutdown:
+            return True
+        if job["cancel"].is_set():
+            return True
+        with self._generation_lock:
+            current_generation = self.load_generation
+        if job["generation"] != current_generation:
+            job["cancel"].set()
+            return True
+        return False
+
+    def _release_staging_lease(self, path):
+        with self._staging_lock:
+            lease = self._staging_leases.pop(path, None)
+            self._staging_ready_paths.pop(path, None)
+        if lease is not None:
+            lease.close()
+
+    def _transfer_staging_lease(self, job, path):
+        """Move a completed job's directory lease to the ready-path map."""
+
+        with self._staging_lock:
+            lease = job.get("lease")
+            if lease is not None:
+                self._staging_leases[path] = lease
+                job["lease"] = None
+                self._staging_ready_paths[path] = time.monotonic()
+                refresh_staging_lease(lease)
+
+    def _register_staging_job(self, video_id, generation):
+        """Claim the single staging slot, or return ``None`` if busy."""
+
+        with self._staging_lock:
+            if (
+                self._pipeline_shutdown
+                or self._staging_active
+                or generation != self.load_generation
+            ):
+                return None
+            job_id = object()
+            job = {
+                "id": job_id,
+                "video_id": video_id,
+                "generation": generation,
+                "cancel": threading.Event(),
+                "done": threading.Event(),
+                "path": None,
+                "root": None,
+                "ydl": None,
+                "lease": None,
+                "budget_lease": None,
+                "thread": threading.current_thread(),
+                "last_size_check": 0.0,
+            }
+            self._staging_jobs[job_id] = job
+            self._staging_active = True
+            return job
+
+    def _finish_staging_job(self, job):
+        with self._staging_lock:
+            if self._staging_jobs.get(job["id"]) is job:
+                self._staging_jobs.pop(job["id"], None)
+                self._staging_active = bool(self._staging_jobs)
+
+    def _cancel_staging_jobs(self, reason="cancelled", wait=False, timeout=0.25):
+        """Ask in-flight yt-dlp jobs to stop and return their records.
+
+        Progress hooks provide the hard cancellation point.  Closing the
+        downloader as well makes a blocked HTTP read unwind on runtimes that
+        expose ``YoutubeDL.close()``; the short wait is opt-in so a GTK
+        callback never blocks on network teardown.
+        """
+
+        with self._staging_lock:
+            jobs = list(self._staging_jobs.values())
+            downloaders = [job.get("ydl") for job in jobs]
+        for job in jobs:
+            if not job["cancel"].is_set():
+                print(f"[STAGING] cancelling {job['video_id']} ({reason})")
+                job["cancel"].set()
+        for downloader in downloaders:
+            if downloader is None:
+                continue
+            try:
+                close = getattr(downloader, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+        if wait:
+            deadline = time.monotonic() + max(0.0, timeout)
+            for job in jobs:
+                remaining = max(0.0, deadline - time.monotonic())
+                if not job["done"].wait(remaining):
+                    break
+        return jobs
+
+    def _download_upload_to_tmpfs(self, video_id, generation):
+        """Download one bounded local playback file with yt-dlp.
+
+        Upload-locker tracks and manifest-only streams use this path when a
+        remote URL cannot be seeked reliably.  A single staging slot keeps
+        concurrent downloads from multiplying memory/disk use; a progress
+        hook enforces both cancellation and a hard byte budget.  Returning
+        ``None`` is intentionally recoverable: callers fall back to normal
+        streaming when staging is busy, stale, or too large.
+        """
         import tempfile
 
-        tmp_dir = tempfile.mkdtemp(prefix="ventapes-stream-", dir=self._tmpfs_root())
-        outtmpl = os.path.join(tmp_dir, f"{video_id}.%(ext)s")
+        if (
+            not video_id
+            or self._pipeline_shutdown
+            or generation != self.load_generation
+        ):
+            return None
 
-        opts = self.ydl_opts.copy()
-        opts["outtmpl"] = outtmpl
-        opts["quiet"] = True
-        opts["noprogress"] = True
-        # Don't write thumbnails / json / etc into the tmpfs dir.
-        opts["writethumbnail"] = False
-        opts["writeinfojson"] = False
-
-        cookie_file = None
-        try:
-            if self.client.is_authenticated() and self.client.api:
-                cookie_file = self._create_cookie_file(self.client.api.headers)
-                if cookie_file:
-                    opts["cookiefile"] = cookie_file
-                ua = self.client.api.headers.get("User-Agent")
-                if ua:
-                    opts["user_agent"] = ua
-                    opts["http_headers"] = {"User-Agent": ua}
-
-            url = f"https://music.youtube.com/watch?v={video_id}"
-            with YoutubeDL(opts) as ydl:
-                ydl.download([url])
-
-            if generation != self.load_generation:
-                # User skipped during the download — discard the half-baked
-                # file rather than handing it back for playback.
-                self._rm_tmpfs_dir(tmp_dir)
+        # Sweep directories left by a crash or a previous process before
+        # charging their bytes to this job's budget.  The budget lease below
+        # serializes the observe-and-create window across application
+        # processes; without it two instances could each see the same free
+        # baseline and jointly exceed the aggregate cap.
+        self._sweep_staging_roots()
+        budget_lease = acquire_staging_lock(
+            self._get_staging_budget_lock_path(), blocking=False
+        )
+        if budget_lease is None:
+            # Another instance is actively staging.  Falling back to the
+            # ordinary stream is safer than multiplying a large temporary
+            # file, and the caller already has that recovery path.
+            return None
+        job = self._register_staging_job(video_id, generation)
+        if job is None:
+            # A just-skipped upload may still be unwinding its cancellation.
+            # Give that worker a short, non-UI-thread window to release the
+            # single staging slot instead of immediately falling back to an
+            # unreliable remote stream.
+            deadline = time.monotonic() + 0.5
+            while job is None and generation == self.load_generation:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+                job = self._register_staging_job(video_id, generation)
+            if job is None:
+                budget_lease.close()
                 return None
 
-            for name in os.listdir(tmp_dir):
-                if name.startswith(video_id + "."):
-                    return os.path.join(tmp_dir, name)
-            self._rm_tmpfs_dir(tmp_dir)
+        job["budget_lease"] = budget_lease
+        tmp_dir = None
+        cookie_file = None
+        result_path = None
+        download_result = None
+        keep_dir = False
+        try:
+            staging_root = self._tmpfs_root()
+            tmp_dir = tempfile.mkdtemp(
+                prefix=STAGING_DIR_PREFIX,
+                dir=staging_root,
+            )
+            dir_lease = acquire_staging_lease(tmp_dir, blocking=False)
+            if dir_lease is None:
+                raise StagingLimitExceeded("could not claim staging directory")
+            job["lease"] = dir_lease
+            with self._staging_lock:
+                job["path"] = tmp_dir
+                self._staging_paths.add(tmp_dir)
+                job["root"] = staging_root
+                base_bytes = self._staging_used_bytes() - directory_size(tmp_dir)
+                available = self._staging_limit_bytes - max(0, base_bytes)
+                try:
+                    free_bytes = shutil.disk_usage(job["root"]).free
+                    # Keep a small reserve for the filesystem itself rather
+                    # than consuming the final blocks with a staging file.
+                    available = min(
+                        available,
+                        max(0, free_bytes - 4 * 1024 * 1024),
+                    )
+                except OSError:
+                    pass
+                job["base_bytes"] = max(0, base_bytes)
+                job["budget"] = max(0, available)
+            if job["budget"] <= 0:
+                raise StagingLimitExceeded("staging budget or free space is exhausted")
+
+            outtmpl = os.path.join(tmp_dir, "audio.%(ext)s")
+            opts = self.ydl_opts.copy()
+            opts["outtmpl"] = outtmpl
+            opts["quiet"] = True
+            opts["noprogress"] = True
+            opts["writethumbnail"] = False
+            opts["writeinfojson"] = False
+            # This is a backstop for formats that report their size before
+            # the first progress callback.  The progress hook below remains
+            # authoritative because downloaded_bytes is available even when
+            # total size is unknown.
+            opts["max_filesize"] = max(1, job["budget"])
+            opts["socket_timeout"] = 20
+            opts["match_filter"] = self._compose_match_filter(
+                self.ydl_opts.get("match_filter"),
+                self._staging_match_filter(job),
+            )
+            existing_progress = self.ydl_opts.get("progress_hooks") or []
+            if callable(existing_progress):
+                existing_progress = [existing_progress]
+            opts["progress_hooks"] = list(existing_progress) + [
+                self._staging_progress_hook(job)
+            ]
+            existing_post = self.ydl_opts.get("postprocessor_hooks") or []
+            if callable(existing_post):
+                existing_post = [existing_post]
+            opts["postprocessor_hooks"] = list(existing_post) + [
+                self._staging_progress_hook(job, postprocessor=True)
+            ]
+
+            if self.client.is_authenticated() and self.client.api:
+                request_headers = dict(self.client.api.headers or {})
+                cookie_file = self._create_cookie_file(request_headers)
+                if cookie_file:
+                    opts["cookiefile"] = cookie_file
+                ua = request_headers.get("User-Agent")
+                if ua:
+                    opts["user_agent"] = ua
+                # yt-dlp's HTTP source does not inherit the API client's
+                # Authorization/X-Goog headers automatically.  Copy the
+                # non-cookie headers so private upload/media URLs work on
+                # the staging path as they do in the normal resolver.
+                http_headers = dict(opts.get("http_headers") or {})
+                http_headers.update({
+                    str(key): str(value)
+                    for key, value in request_headers.items()
+                    if (
+                        str(key).lower() != "cookie" or not cookie_file
+                    ) and value is not None
+                })
+                opts["http_headers"] = http_headers
+
+            if self._staging_cancelled(job):
+                raise StagingCancelled()
+            url = f"https://music.youtube.com/watch?v={video_id}"
+            with YoutubeDL(opts) as ydl:
+                with self._staging_lock:
+                    job["ydl"] = ydl
+                if self._staging_cancelled(job):
+                    try:
+                        ydl.close()
+                    except Exception:
+                        pass
+                    raise StagingCancelled()
+                try:
+                    download_result = ydl.download([url])
+                finally:
+                    with self._staging_lock:
+                        if job.get("ydl") is ydl:
+                            job["ydl"] = None
+
+            if self._staging_cancelled(job):
+                raise StagingCancelled("staging job was superseded")
+
+            expected_name = _yt_dlp_final_filename(download_result)
+            result_path = find_completed_audio(
+                tmp_dir,
+                expected_name=os.path.basename(expected_name) if expected_name else None,
+            )
+            if result_path is None:
+                return None
+            if directory_size(tmp_dir) > job["budget"]:
+                raise StagingLimitExceeded("staged file exceeded its budget")
+            keep_dir = True
+            return result_path
+        except StagingCancelled:
             return None
-        except Exception as e:
-            print(f"[PLAYER] tmpfs download error for {video_id}: {e}")
-            self._rm_tmpfs_dir(tmp_dir)
+        except StagingLimitExceeded as exc:
+            print(f"[STAGING] bounded download stopped for {video_id}: {exc}")
+            return None
+        except Exception as exc:
+            print(f"[PLAYER] tmpfs download error for {video_id}: {exc}")
             return None
         finally:
-            if cookie_file and os.path.exists(cookie_file):
+            if cookie_file:
                 try:
                     os.remove(cookie_file)
                 except OSError:
                     pass
+            if keep_dir and tmp_dir:
+                # Keep the lease while the completed file waits for the GTK
+                # handoff.  _adopt_staged_path() transfers that ownership to
+                # the current playback path.
+                self._transfer_staging_lease(job, tmp_dir)
+            elif tmp_dir:
+                # The directory lease belongs to this job, not to a live
+                # playback source.  Release it before asking the ownership-
+                # checked remover to delete the directory; a failed removal
+                # is re-leased below so another process cannot race us.
+                lease = job.get("lease")
+                job["lease"] = None
+                if lease is not None:
+                    lease.close()
+                if not self._remove_owned_staging_dir(tmp_dir):
+                    retained = acquire_staging_lease(tmp_dir, blocking=False)
+                    if retained is not None:
+                        with self._staging_lock:
+                            self._staging_leases[tmp_dir] = retained
+                            self._staging_ready_paths.setdefault(
+                                tmp_dir, time.monotonic()
+                            )
+            budget_lease = job.get("budget_lease")
+            job["budget_lease"] = None
+            if budget_lease is not None:
+                budget_lease.close()
+            self._finish_staging_job(job)
+            job["done"].set()
+
+    def _staging_progress_hook(self, job, postprocessor=False):
+        """Build a yt-dlp progress callback tied to one staging job."""
+
+        def _hook(status):
+            if self._staging_cancelled(job):
+                raise StagingCancelled()
+            refresh_staging_lease(job.get("lease"))
+            if not isinstance(status, dict):
+                return status
+
+            if reported_size_exceeds(status, job.get("budget", 0)):
+                raise StagingLimitExceeded("reported download size exceeds budget")
+
+            # Progress metadata can be absent for fragmented downloads, and
+            # postprocessors can create additional temporary files.  Check
+            # the actual directory periodically, plus whenever we are close
+            # to the hard limit, so those paths cannot evade the cap.
+            now = time.monotonic()
+            try:
+                downloaded = int(status.get("downloaded_bytes") or 0)
+            except (TypeError, ValueError):
+                downloaded = 0
+            if (
+                postprocessor
+                or downloaded >= job.get("budget", 0) * 0.9
+                or now - job.get("last_size_check", 0.0) >= 0.25
+            ):
+                actual = directory_size(job.get("path"))
+                if actual > job.get("budget", 0):
+                    raise StagingLimitExceeded("staging directory exceeded budget")
+                job["last_size_check"] = now
+
+            root = job.get("root")
+            if root:
+                try:
+                    if shutil.disk_usage(root).free < 4 * 1024 * 1024:
+                        raise StagingLimitExceeded("staging filesystem is full")
+                except OSError:
+                    pass
+            return status
+
+        return _hook
 
     @staticmethod
-    def _rm_tmpfs_dir(path):
+    def _compose_match_filter(existing, added):
+        """Preserve a caller-supplied format filter before ours."""
+
+        if not existing:
+            return added
+        filters = (
+            list(existing)
+            if isinstance(existing, (list, tuple))
+            else [existing]
+        )
+
+        def _filter(info, **kwargs):
+            for filter_fn in filters:
+                result = filter_fn(info, **kwargs)
+                if result is not None:
+                    return result
+            return added(info, **kwargs)
+
+        return _filter
+
+    @staticmethod
+    def _staging_match_filter(job):
+        """Reject an oversized format before yt-dlp starts downloading it."""
+
+        def _filter(info, **_kwargs):
+            size = None
+            for key in ("filesize", "filesize_approx"):
+                value = info.get(key) if isinstance(info, dict) else None
+                try:
+                    if value is not None:
+                        size = int(value)
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if size is not None and size > job.get("budget", 0):
+                raise StagingLimitExceeded("format is larger than staging budget")
+            return None
+
+        return _filter
+
+    @staticmethod
+    def _rm_tmpfs_dir(path, roots=None):
+        """Compatibility wrapper for the historical private helper.
+
+        Older integrations called ``Player._rm_tmpfs_dir(path)`` as a
+        class/static helper.  Keep that call shape best-effort; all current
+        in-tree cleanup goes through ``_remove_owned_staging_dir`` so an
+        untrusted path cannot bypass the root/lease checks.
+        """
+
         if not path:
-            return
+            return False
         try:
-            import shutil
-            shutil.rmtree(path, ignore_errors=True)
+            if staging_lease_state(path) == "held":
+                return False
+            if roots is None:
+                shutil.rmtree(path, ignore_errors=False)
+                return True
+            return remove_staging_dir(path, roots)
+        except OSError:
+            return not os.path.lexists(path)
+
+    def _remove_owned_staging_dir(self, path):
+        # Release this process's lease before the ownership check.  A lease
+        # held by another process remains held and makes removal fail safely.
+        self._release_staging_lease(path)
+        roots = self._staging_roots()
+        try:
+            removed = remove_staging_dir(path, roots)
         except Exception:
-            pass
+            removed = False
+        confirmed = removed or not os.path.lexists(path)
+        if confirmed:
+            with self._staging_lock:
+                self._staging_paths.discard(path)
+                self._staging_ready_paths.pop(path, None)
+        elif os.path.lexists(path):
+            # Keep ownership if removal failed so a later retry cannot be
+            # mistaken for abandoned work by another process.
+            retained = acquire_staging_lease(path, blocking=False)
+            if retained is not None:
+                with self._staging_lock:
+                    self._staging_leases[path] = retained
+                    self._staging_ready_paths.setdefault(
+                        path, time.monotonic()
+                    )
+        return confirmed
 
     def _cleanup_tmpfs_path(self, path):
-        """Remove a single tmpfs file + its parent dir (we use a fresh
-        mkdtemp per track so the dir contains only the one file)."""
+        """Remove a single staging file and its owned parent directory."""
+
         if not path:
-            return
-        try:
-            parent = os.path.dirname(path)
-            if parent and "ventapes-stream-" in parent:
-                self._rm_tmpfs_dir(parent)
-            elif os.path.exists(path):
+            return False
+        parent = os.path.dirname(path)
+        confirmed = False
+        if parent and is_staging_dir(parent, self._staging_roots()):
+            confirmed = self._remove_owned_staging_dir(parent)
+        elif not os.path.lexists(path):
+            confirmed = True
+        elif os.path.isfile(path) and not os.path.islink(path):
+            # Preserve cleanup for paths produced by the pre-staging helper;
+            # current new paths always take the directory branch above.
+            try:
                 os.remove(path)
-        except OSError as e:
-            print(f"[PLAYER] tmpfs cleanup failed for {path}: {e}")
+                confirmed = True
+            except OSError as exc:
+                print(f"[PLAYER] tmpfs cleanup failed for {path}: {exc}")
+        if confirmed:
+            with self._staging_lock:
+                self._staging_paths.discard(path)
+                self._staging_paths.discard(parent)
+                self._staging_ready_paths.pop(parent, None)
+        return confirmed
 
     def _cleanup_all_tmpfs(self):
-        """atexit hook — sweep our prefix dirs in the tmpfs root in case a
-        prior crash left orphans, plus our currently tracked path."""
-        if self._current_tmpfs_path:
-            self._cleanup_tmpfs_path(self._current_tmpfs_path)
-            self._current_tmpfs_path = None
+        """Best-effort process-exit cleanup for staged local sources.
+
+        ``atexit`` can run without ``shutdown()`` (or while the pipeline
+        worker is still stopping), so a current source is only removed after
+        a confirmed NULL transition.  Ready-but-unclaimed paths are kept
+        until that confirmation; their leases are released when the process
+        exits and the next startup sweep can reclaim them safely.
+        """
+
+        jobs = self._cancel_staging_jobs("shutdown", wait=True, timeout=0.5)
+        null_confirmed = self._pipeline_null_confirmed.is_set()
+        current = getattr(self, "_current_tmpfs_path", None)
+        if current and null_confirmed:
+            if self._cleanup_tmpfs_path(current):
+                with self._staging_lock:
+                    if self._current_tmpfs_path == current:
+                        self._current_tmpfs_path = None
+
+        if null_confirmed:
+            try:
+                with self._staging_lock:
+                    pending = list(self._pending_tmpfs_cleanups)
+                    self._pending_tmpfs_cleanups.clear()
+                for path in pending:
+                    self._cleanup_tmpfs_path(path)
+            except Exception:
+                pass
+
         try:
-            root = self._tmpfs_root()
-            for name in os.listdir(root):
-                if name.startswith("ventapes-stream-"):
-                    self._rm_tmpfs_dir(os.path.join(root, name))
-        except OSError:
+            with self._staging_lock:
+                owned = list(self._staging_paths)
+                ready = dict(self._staging_ready_paths)
+                active_paths = {
+                    job.get("path")
+                    for job in jobs
+                    if job.get("path") and not job["done"].is_set()
+                }
+            for path in owned:
+                if path in active_paths:
+                    continue
+                if not null_confirmed:
+                    # Until the serialized worker has confirmed NULL, every
+                    # tracked directory may still back the active/deferred
+                    # source.  The old path==current check compared a
+                    # directory with a file path and could unlink live audio.
+                    # Keep the whole set for the next handoff/cleanup pass.
+                    continue
+                ready_at = ready.get(path)
+                if ready_at is not None and not null_confirmed:
+                    # The download worker has finished, but the GTK handoff
+                    # callback may be next in the loop.  Without a confirmed
+                    # NULL, leave every ready path for the next startup
+                    # sweep rather than guessing that the handoff is stale.
+                    continue
+                self._remove_owned_staging_dir(path)
+            keep = self._staging_keep_paths()
+            # A downloader that ignored cancellation is still allowed to
+            # finish; never unlink its directory underneath an open handle.
+            keep.extend(active_paths)
+            for root in self._staging_roots():
+                sweep_staging_dirs(root, keep=keep)
+        except Exception:
+            # atexit runs while GLib may already be shutting down; cleanup is
+            # best effort and must never mask the process exit.
             pass
+
+    def _defer_tmpfs_cleanup(self, path=None):
+        """Release a local fallback after the pipeline reaches NULL."""
+
+        if not path:
+            return
+        with self._staging_lock:
+            if path == self._current_tmpfs_path:
+                self._current_tmpfs_path = None
+            if path not in self._pending_tmpfs_cleanups:
+                self._pending_tmpfs_cleanups.append(path)
+
+    def _cleanup_pending_tmpfs(self):
+        with self._staging_lock:
+            paths = list(self._pending_tmpfs_cleanups)
+            self._pending_tmpfs_cleanups.clear()
+        remaining = []
+        for path in paths:
+            self._cleanup_tmpfs_path(path)
+            parent = os.path.dirname(path)
+            if os.path.lexists(path) or (parent and os.path.lexists(parent)):
+                remaining.append(path)
+        if remaining:
+            with self._staging_lock:
+                for path in remaining:
+                    if path not in self._pending_tmpfs_cleanups:
+                        self._pending_tmpfs_cleanups.append(path)
+
+    def _adopt_staged_path(self, path, video_id, generation, source="local staged"):
+        """Adopt a completed download on the GTK thread or discard it."""
+
+        if not path or self._pipeline_shutdown:
+            self._cleanup_tmpfs_path(path)
+            return False
+        with self._generation_lock:
+            current_generation = self.load_generation
+        if generation != current_generation:
+            self._cleanup_tmpfs_path(path)
+            return False
+        if self.current_video_id != video_id or not os.path.isfile(path):
+            self._cleanup_tmpfs_path(path)
+            return False
+        with self._staging_lock:
+            previous = self._current_tmpfs_path
+            self._current_tmpfs_path = path
+            self._staging_ready_paths.pop(path, None)
+        if previous and previous != path:
+            self._defer_tmpfs_cleanup(previous)
+        try:
+            file_uri = GLib.filename_to_uri(os.path.abspath(path), None)
+        except Exception:
+            if self._cleanup_tmpfs_path(path):
+                with self._staging_lock:
+                    if self._current_tmpfs_path == path:
+                        self._current_tmpfs_path = None
+            return False
+        self._stream_debug = {
+            "source": source,
+            "video_id": video_id,
+            "path": path,
+        }
+        try:
+            source_id = GObject.idle_add(
+                self._start_playback, file_uri, generation
+            )
+            if not source_id:
+                raise RuntimeError("could not schedule staged playback")
+        except Exception:
+            if self._cleanup_tmpfs_path(path):
+                with self._staging_lock:
+                    if self._current_tmpfs_path == path:
+                        self._current_tmpfs_path = None
+            return False
+        return False
+
+    def _queue_staged_playback(self, path, video_id, generation, source):
+        try:
+            source_id = GObject.idle_add(
+                self._adopt_staged_path, path, video_id, generation, source
+            )
+            if not source_id:
+                self._cleanup_tmpfs_path(path)
+            return source_id
+        except Exception:
+            self._cleanup_tmpfs_path(path)
+            return False
 
     def _noseek_vids_path(self):
         return os.path.join(
@@ -1837,8 +2824,8 @@ class Player(GObject.Object):
                         swapped, title_hint, artist_hint
                     )
                 GObject.idle_add(
-                    self.emit,
-                    "metadata-changed",
+                    self._emit_metadata_if_current,
+                    generation,
                     str(title_hint),
                     str(artist_hint),
                     str(thumb_hint or ""),
@@ -1858,33 +2845,33 @@ class Player(GObject.Object):
         if track.get("entityId") or video_id in self._noseek_vids:
             tmpfs_path = self._download_upload_to_tmpfs(video_id, generation)
             if generation != self.load_generation:
-                # User skipped while we were downloading — _download cleans
-                # up its own tmp dir on cancel via the generation check.
+                # The download can finish in the small window after its
+                # generation check.  Callers own the returned path, so clean
+                # it here rather than leaving a completed orphan staged.
+                self._cleanup_tmpfs_path(tmpfs_path)
                 return
             if tmpfs_path:
-                self._current_tmpfs_path = tmpfs_path
-                file_uri = GLib.filename_to_uri(os.path.abspath(tmpfs_path), None)
                 self._used_cached_url = False
-                self._stream_debug = {
-                    "source": "local tmpfs (non-seekable stream fallback)"
+                source = (
+                    "local staged (non-seekable stream fallback)"
                     if video_id in self._noseek_vids and not track.get("entityId")
-                    else "local tmpfs (upload)",
-                    "video_id": video_id,
-                    "path": tmpfs_path,
-                }
+                    else "local staged (upload)"
+                )
                 final_title = title_hint or track.get("title") or "Unknown"
                 final_artist = artist_hint or track.get("artist") or "Unknown"
                 final_thumb = thumb_hint or track.get("thumb") or ""
                 GObject.idle_add(
-                    self.emit,
-                    "metadata-changed",
+                    self._emit_metadata_if_current,
+                    generation,
                     final_title,
                     final_artist,
                     final_thumb,
                     video_id,
                     like_status_hint,
                 )
-                GLib.idle_add(self._start_playback, file_uri)
+                self._queue_staged_playback(
+                    tmpfs_path, video_id, generation, source
+                )
                 return
             # tmpfs download failed — fall through to the normal streaming
             # path. Seek won't work, but at least playback won't be blocked.
@@ -1922,6 +2909,22 @@ class Player(GObject.Object):
 
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+                # HLS/DASH URLs often report seekable while their source
+                # stalls before the first buffer. Stage those formats locally
+                # instead of handing an unreliable manifest to playbin.
+                if _is_manifest_protocol(
+                    info.get("protocol") or info.get("url") or info.get("manifest_url")
+                ):
+                    self._mark_noseek(video_id)
+                    staged = self._download_upload_to_tmpfs(video_id, generation)
+                    if staged:
+                        self._queue_staged_playback(
+                            staged,
+                            video_id,
+                            generation,
+                            "local staged manifest fallback",
+                        )
+                        return
                 stream_url = info["url"]
 
                 # Snapshot the resolved format for the debug panel. This is
@@ -2021,23 +3024,26 @@ class Player(GObject.Object):
                         os.remove(cookie_file)
                     return
 
-                # Cache the stream URL for future plays
-                self.stream_cache.put(video_id, stream_url)
+                # Do not persist a signed URL until GStreamer confirms the
+                # source reached PLAYING.  Caching a URL that merely looked
+                # valid to yt-dlp is what made a bad CDN response survive
+                # across reloads.
+                self._pending_stream_cache = (generation, video_id, stream_url)
 
                 if getattr(self, "_cache_failed_waiting", False):
                     # Cached URL failed earlier, yt-dlp just finished - play now
                     print("[CACHE] yt-dlp finished, playing after cache failure")
                     self._cache_failed_waiting = False
-                    GObject.idle_add(self._start_playback, stream_url)
+                    GObject.idle_add(self._start_playback, stream_url, generation)
                 elif self._used_cached_url:
                     # Store the fresh URL as fallback in case cached URL fails
                     self._fallback_stream_url = stream_url
                 else:
-                    GObject.idle_add(self._start_playback, stream_url)
+                    GObject.idle_add(self._start_playback, stream_url, generation)
 
                 GObject.idle_add(
-                    self.emit,
-                    "metadata-changed",
+                    self._emit_metadata_if_current,
+                    generation,
                     final_title,
                     final_artist,
                     final_thumb,
@@ -2046,7 +3052,8 @@ class Player(GObject.Object):
                 )
 
                 # Pre-cache next songs in queue
-                self._precache_next(generation)
+                if self._precache_enabled:
+                    self._precache_next(generation)
         except Exception as e:
             # yt-dlp throws DownloadError / ExtractorError when a video is
             # unavailable, region-locked, removed, etc. The previous code
@@ -2094,16 +3101,13 @@ class Player(GObject.Object):
         return msg[:140]
 
     def _precache_next(self, generation, max_count=None):
-        """Pre-cache stream URLs for songs ahead and behind in the queue.
+        """Pre-cache stream URLs for nearby queue entries, cancellably."""
 
-        ``max_count`` caps how many neighbours we resolve in this call.
-        We use ``max_count=1`` when this fires *eagerly* (at the start of
-        the current track's load) so the user sees no Next-press delay,
-        but we don't pile yt-dlp work onto the GIL while the playlist
-        page is being assembled. The full 6-neighbour sweep still fires
-        from the end of ``_fetch_and_play``, by which time the bind
-        storm has settled.
-        """
+        with self._precache_lock:
+            epoch = self._precache_epoch
+            cancel = self._precache_cancel
+        if not self._precache_still_current(epoch, cancel):
+            return
         if generation != self.load_generation:
             return
 
@@ -2115,40 +3119,42 @@ class Player(GObject.Object):
                 indices.append(current + offset)
             if current - offset >= 0:
                 indices.append(current - offset)
-
         if max_count is not None:
             indices = indices[:max_count]
+        if not indices:
+            return
 
         from yt_dlp import YoutubeDL
-        import time as _time
 
         for i, idx in enumerate(indices):
-            if generation != self.load_generation:
+            if not self._precache_still_current(epoch, cancel):
                 return
             # Throttle between extractions so the GIL stays free for the
-            # UI thread between batches. yt-dlp holds the GIL during JSON
-            # parse + JS interpretation; a brief release lets the main
-            # loop draw a frame.
-            if i > 0:
-                _time.sleep(0.25)
+            # UI thread between batches.  Event.wait also makes disabling
+            # pre-cache or changing tracks interrupt the sleep promptly.
+            if i > 0 and cancel.wait(0.25):
+                return
+            if not self._precache_still_current(epoch, cancel):
+                return
             if generation != self.load_generation:
                 return
+
             track = self.queue[idx]
             vid = track.get("videoId")
             if not vid or self.stream_cache.get(vid):
                 continue
-            # Skip upload tracks — their stream URL would be unusable anyway
-            # (we always play them from a tmpfs buffer). Avoids wasted yt-dlp
-            # extractions in the background.
+            # Upload tracks are staged locally, so their remote URL is not
+            # useful background work.
             if track.get("entityId"):
                 continue
+
+            cookie_file = None
+            ydl = None
             try:
                 url = f"https://music.youtube.com/watch?v={vid}"
                 opts = self.ydl_opts.copy()
                 opts["quiet"] = True
                 opts.pop("verbose", None)
-
-                cookie_file = None
                 if self.client.is_authenticated() and self.client.api:
                     cookie_file = self._create_cookie_file(self.client.api.headers)
                     if cookie_file:
@@ -2157,20 +3163,66 @@ class Player(GObject.Object):
                     if ua:
                         opts["user_agent"] = ua
 
-                with YoutubeDL(opts) as ydl:
+                ydl = YoutubeDL(opts)
+                with self._precache_lock:
+                    if not self._precache_still_current(epoch, cancel):
+                        try:
+                            ydl.close()
+                        except Exception:
+                            pass
+                        return
+                    self._precache_downloaders.add(ydl)
+                with ydl:
+                    if not self._precache_still_current(epoch, cancel):
+                        continue
                     info = ydl.extract_info(url, download=False)
+                    if _is_manifest_protocol(
+                        info.get("protocol")
+                        or info.get("url")
+                        or info.get("manifest_url")
+                    ):
+                        continue
                     stream_url = info["url"]
                     del info
+                if not self._precache_still_current(epoch, cancel):
+                    continue
                 self.stream_cache.put(vid, stream_url)
                 print(f"[CACHE] Pre-cached stream URL for song {idx}: {vid}")
-            except Exception as e:
-                print(f"[CACHE] Pre-cache error for {vid}: {e}")
+            except Exception as exc:
+                if not cancel.is_set():
+                    print(f"[CACHE] Pre-cache error for {vid}: {exc}")
             finally:
+                if ydl is not None:
+                    with self._precache_lock:
+                        self._precache_downloaders.discard(ydl)
                 if cookie_file and os.path.exists(cookie_file):
                     try:
                         os.remove(cookie_file)
                     except OSError:
                         pass
+
+    def _commit_pending_stream_cache(self):
+        pending = self._pending_stream_cache
+        if not pending:
+            return
+        # The tuple is generation-aware so a late resolver cannot cache a
+        # URL that belongs to a track/source which has already been replaced.
+        if len(pending) == 3:
+            generation, video_id, stream_url = pending
+        else:  # tolerate a tuple left by an older in-process callback
+            video_id, stream_url = pending
+            generation = self.load_generation
+        if generation != self.load_generation or video_id != self.current_video_id:
+            self._pending_stream_cache = None
+            return
+        # A cached URL can be playing while the background resolver has just
+        # produced a different fallback URL.  Keep the latter pending until
+        # that exact URI reaches PLAYING; otherwise the first source's
+        # STATE_CHANGED event would incorrectly persist the untried fallback.
+        if not self._current_play_uri or stream_url != self._current_play_uri:
+            return
+        self._pending_stream_cache = None
+        self.stream_cache.put(video_id, stream_url)
 
     def _on_source_setup(self, playbin, source):
         """Configure the HTTP source element playbin just created. We push
@@ -2186,6 +3238,22 @@ class Player(GObject.Object):
         except Exception:
             name = ""
         self._source_factory_name = name or None
+        # Bus errors are asynchronous and do not carry a load generation.
+        # Keep a small source-id map so an error from the previous source
+        # cannot be applied to the track that replaced it.
+        self._last_source_id = id(source)
+        self._last_source_key = source
+        if self._pipeline_generation is not None:
+            generation = self._pipeline_generation
+            with self._source_generation_lock:
+                self._source_generations[self._last_source_id] = generation
+                try:
+                    self._source_generations[source] = generation
+                except (TypeError, AttributeError):
+                    pass
+                if len(self._source_generations) > 64:
+                    for old_id in list(self._source_generations)[:-64]:
+                        self._source_generations.pop(old_id, None)
         if name not in ("souphttpsrc", "curlhttpsrc"):
             return
 
@@ -2216,46 +3284,432 @@ class Player(GObject.Object):
         except Exception as e:
             print(f"[PLAYER] source-setup hook error ({type(e).__name__}).")
 
-    def _start_playback(self, uri, cookie_file=None):
-        self._current_play_uri = uri
-        # NULL→URI→PLAYING must happen in order, but set_state(NULL) can
-        # block for hundreds of ms while GStreamer flushes the previous
-        # stream. Off-load the whole sequence to a worker so the UI
-        # thread doesn't pay for it. set_state is thread-safe and serializes
-        # against the (now also threaded) NULL transition kicked off in
-        # _load_internal via the pipeline's internal state-change lock.
-        def _drive():
-            try:
-                self.player.set_state(Gst.State.NULL)
-                self.player.set_property("uri", uri)
-                self.player.set_state(Gst.State.PLAYING)
-            except Exception as e:
-                print(f"[PLAYBACK] start failed: {e}")
-        threading.Thread(target=_drive, daemon=True).start()
+    def _emit_metadata_if_current(self, generation, title, artist, thumb, video_id, like_status):
+        """Publish metadata only if its load still owns the player."""
 
+        if generation != self.load_generation:
+            return GLib.SOURCE_REMOVE
+        self.emit(
+            "metadata-changed", title, artist, thumb, video_id, like_status
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _ensure_pipeline_worker_locked(self):
+        # Several UI and bus callbacks can request a transition at once.  A
+        # check-then-start without a lock can create two workers, defeating
+        # the serialization this class is built around.
+        if self._pipeline_shutdown:
+            return
+        worker = self._pipeline_worker
+        if worker is not None and worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=self._pipeline_loop,
+            name="ventapes-pipeline",
+            daemon=True,
+        )
+        self._pipeline_worker = worker
+        try:
+            worker.start()
+        except Exception:
+            self._pipeline_worker = None
+            raise
+
+    def _ensure_pipeline_worker(self):
+        with self._pipeline_worker_lock:
+            self._ensure_pipeline_worker_locked()
+
+    def _queue_pipeline_command(self, action, generation=None, uri=None):
+        # Keep the shutdown check, worker creation, and queue insertion under
+        # one mutex.  Otherwise shutdown can append its sentinel in the gap
+        # and a late play command can be stranded behind it (or win the
+        # sentinel batch).
+        with self._pipeline_worker_lock:
+            if self._pipeline_shutdown:
+                return
+            self._ensure_pipeline_worker_locked()
+            self._pipeline_commands.put((action, generation, uri))
+
+    def shutdown(self):
+        """Stop the serialized worker and release local playback files."""
+
+        with self._pipeline_worker_lock:
+            if self._pipeline_shutdown:
+                return
+            worker = self._pipeline_worker
+            self._pipeline_shutdown = True
+            # Publish the terminal commands while holding the same mutex used
+            # by _queue_pipeline_command().  Once the flag is set, no new
+            # command can be inserted after this sentinel.
+            if worker is not None:
+                self._pipeline_commands.put(("stop", None))
+                self._pipeline_commands.put(None)
+                self._pipeline_shutdown_sentinel.set()
+
+        try:
+            if getattr(self, "scrobbler", None) is not None:
+                self.scrobbler.stop()
+        except Exception as exc:
+            print(f"[SCROBBLE] shutdown failed: {exc}")
+
+        # The terminal worker will clean deferred paths after NULL.  Queue the
+        # current source now so a slow/stuck worker cannot leave it leased
+        # after shutdown returns.
+        if self._current_tmpfs_path:
+            self._defer_tmpfs_cleanup(self._current_tmpfs_path)
+
+        # Invalidate resolver/staging callbacks before asking the worker to
+        # stop.  Otherwise a late completion can enqueue a new URI after the
+        # shutdown sentinel and keep a staged file alive indefinitely.
+        with self._generation_lock:
+            self.load_generation += 1
+            self._pipeline_generation = None
+            self._stream_started_generation = None
+            self._pending_gapless_index = None
+            self._pending_gapless_generation = None
+            self._is_loading = False
+        self._pipeline_null_confirmed.clear()
+        self._stop_position_timer()
+        self._cancel_staging_jobs("shutdown", wait=True, timeout=0.5)
+        self._cancel_precache("shutdown")
+        if worker is not None and worker.is_alive():
+            if worker is not threading.current_thread():
+                worker.join(timeout=0.75)
+        else:
+            with self._pipeline_lock:
+                result = self._set_pipeline_state(Gst.State.NULL, 300)
+                if result != Gst.StateChangeReturn.FAILURE:
+                    self._pipeline_null_confirmed.set()
+                    self._cleanup_pending_tmpfs()
+        try:
+            self.bus.remove_signal_watch()
+            if getattr(self, "_bus_handler_id", None):
+                self.bus.disconnect(self._bus_handler_id)
+                self._bus_handler_id = None
+        except Exception:
+            pass
+        # Only unlink local sources after the serialized worker has confirmed
+        # NULL.  If it is still unwinding, leave tracked paths for the atexit
+        # pass (which is intentionally conservative) rather than unlinking
+        # under playbin.
+        if self._pipeline_null_confirmed.is_set():
+            self._cleanup_all_tmpfs()
+
+    @staticmethod
+    def _coalesce_pipeline_commands(commands):
+        """Keep rapid transitions short without dropping a final transport edge.
+
+        A play command already performs its own NULL -> URI -> PLAYING
+        transaction, so older stops/controls before the newest play are
+        redundant.  A pause/resume *after* that play is not redundant: users
+        can press Pause while a new URI is still resolving.  A stop after a
+        play is terminal and supersedes the play and any later-looking stale
+        control edge.
+        """
+
+        if not commands:
+            return []
+        last_play = -1
+        for index, command in enumerate(commands):
+            if command[0] == "play":
+                last_play = index
+        if last_play >= 0:
+            trailing = commands[last_play + 1 :]
+            for index in range(len(commands) - 1, last_play, -1):
+                if commands[index][0] == "stop":
+                    return [commands[index]]
+            result = [commands[last_play]]
+            for command in reversed(trailing):
+                if command[0] in ("pause", "resume"):
+                    result.append(command)
+                    break
+            return result
+
+        for command in reversed(commands):
+            if command[0] == "stop":
+                return [command]
+        return [commands[-1]]
+
+    def _pipeline_loop(self):
+        """Serialize GStreamer state changes and collapse command bursts."""
+
+        while True:
+            try:
+                command = self._pipeline_commands.get(timeout=0.5)
+            except queue.Empty:
+                if (
+                    self._pipeline_shutdown
+                    and self._pipeline_shutdown_sentinel.is_set()
+                ):
+                    return
+                continue
+            if command is None:
+                return
+
+            batch = [command]
+            terminal = False
+            while True:
+                try:
+                    newer = self._pipeline_commands.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None:
+                    # Do not let a command inserted after the shutdown
+                    # sentinel win a coalescing batch.  The enqueue mutex
+                    # normally makes this impossible, but keeping the barrier
+                    # explicit makes the worker safe for legacy direct callers.
+                    terminal = True
+                    break
+                batch.append(newer)
+
+            for action, generation, uri in self._coalesce_pipeline_commands(batch):
+                try:
+                    if action == "stop":
+                        # Even an old stop must flush the old source, but it
+                        # must not clear state belonging to a newer load.
+                        self._execute_pipeline_stop(generation)
+                    elif action == "play":
+                        self._execute_pipeline_play(generation, uri)
+                    elif action == "resume":
+                        self._execute_pipeline_resume(generation)
+                    elif action == "pause":
+                        self._execute_pipeline_pause(generation)
+                except Exception as exc:
+                    print(f"[PLAYBACK] pipeline {action} failed: {exc}")
+            if terminal:
+                return
+
+    def _set_pipeline_state(self, state, wait_ms=0):
+        try:
+            result = self.player.set_state(state)
+            if wait_ms:
+                # Waiting happens on this worker, never on the GTK thread.
+                # It prevents a URI handoff from overtaking a still-pending
+                # NULL transition without imposing a long wait on a broken
+                # network source.
+                _, reached, _pending = self.player.get_state(wait_ms * 1_000_000)
+                reached_nick = getattr(reached, "value_nick", reached)
+                if state == Gst.State.NULL and reached != Gst.State.NULL:
+                    print(
+                        f"[PLAYBACK] pipeline did not reach NULL "
+                        f"(state={reached_nick})"
+                    )
+                    return Gst.StateChangeReturn.FAILURE
+                if state == Gst.State.PLAYING and reached != Gst.State.PLAYING:
+                    # ASYNC_DONE/STATE_CHANGED will finish a normal async
+                    # preroll, but a timeout that is still READY/PAUSED (or
+                    # has no state yet) is not a successful transition.
+                    # Report it so the caller can retry or surface a failure
+                    # instead of waiting forever for a buffering message that
+                    # may never arrive.
+                    print(
+                        f"[PLAYBACK] pipeline did not reach PLAYING "
+                        f"(state={reached_nick})"
+                    )
+                    return Gst.StateChangeReturn.FAILURE
+            return result
+        except Exception as exc:
+            print(f"[PLAYBACK] state change to {state} failed: {exc}")
+            return Gst.StateChangeReturn.FAILURE
+
+    def _execute_pipeline_stop(self, generation=None):
+        with self._pipeline_lock:
+            self._pipeline_null_confirmed.clear()
+            result = self._set_pipeline_state(Gst.State.NULL, 300)
+            if result != Gst.StateChangeReturn.FAILURE:
+                self._pipeline_null_confirmed.set()
+                self._cleanup_pending_tmpfs()
+            # The NULL operation is useful even for an old generation, but
+            # state bookkeeping belongs only to the generation that requested
+            # it.  A new load can begin while get_state() is waiting.
+            with self._generation_lock:
+                owns_generation = (
+                    generation is None or generation == self.load_generation
+                )
+                if owns_generation:
+                    self._pending_gapless_index = None
+                    self._pending_gapless_generation = None
+            if owns_generation:
+                self._pipeline_generation = None
+                self._is_loading = False
+                self._seek_after_load = None
+                self._pending_seek = None
+
+    def _execute_pipeline_play(self, generation, uri):
+        if self._pipeline_shutdown:
+            return
+        if generation is None or generation != self.load_generation:
+            return
+        with self._pipeline_lock:
+            if self._pipeline_shutdown or generation != self.load_generation or not uri:
+                return
+            self._current_play_uri = uri
+            self._current_play_uri_generation = generation
+            self._is_loading = True
+            self._pipeline_null_confirmed.clear()
+            null_result = self._set_pipeline_state(Gst.State.NULL, 1000)
+            if null_result == Gst.StateChangeReturn.FAILURE:
+                # A stuck source should not receive a new URI on top of it.
+                # Give the flush one short retry, then surface a stopped
+                # state so the user can explicitly retry instead of leaving
+                # the UI in an unbreakable loading spinner.
+                null_result = self._set_pipeline_state(Gst.State.NULL, 300)
+            if null_result == Gst.StateChangeReturn.FAILURE:
+                if generation == self.load_generation:
+                    self._is_loading = False
+                    self._pipeline_generation = None
+                    self._current_logical_state = "stopped"
+                    GLib.idle_add(self.emit, "state-changed", "stopped")
+                return
+            self._cleanup_pending_tmpfs()
+            if generation != self.load_generation:
+                return
+            self._pipeline_generation = generation
+            self._stream_started_generation = None
+            self._pipeline_started_at = time.monotonic()
+            self.player.set_property("uri", uri)
+            if generation != self.load_generation:
+                return
+            result = self._set_pipeline_state(Gst.State.PLAYING, 900)
+            if result == Gst.StateChangeReturn.FAILURE:
+                # A few HTTP/source implementations report a transient
+                # failure while their socket is being replaced.  Retry once
+                # on the same serialized worker; never start a second
+                # transition thread here.
+                import time as _time
+                _time.sleep(0.08)
+                if generation == self.load_generation:
+                    retry_result = self._set_pipeline_state(
+                        Gst.State.PLAYING, 500
+                    )
+                    if retry_result == Gst.StateChangeReturn.FAILURE:
+                        self._is_loading = False
+                        self._update_logical_state()
+
+    def _execute_pipeline_resume(self, generation=None):
+        if self._pipeline_shutdown:
+            return
+        if generation is not None and generation != self.load_generation:
+            return
+        with self._pipeline_lock:
+            if self._pipeline_shutdown:
+                return
+            self._set_pipeline_state(Gst.State.PLAYING, 500)
+
+    def _execute_pipeline_pause(self, generation=None):
+        if self._pipeline_shutdown:
+            return
+        if generation is not None and generation != self.load_generation:
+            return
+        with self._pipeline_lock:
+            if self._pipeline_shutdown:
+                return
+            self._set_pipeline_state(Gst.State.PAUSED, 300)
+
+    def _start_playback(self, uri, generation=None, cookie_file=None):
+        if not uri or self._pipeline_shutdown:
+            return False
+        # Before generation-aware playback, the second positional argument
+        # was the optional cookie-file path.  Keep that private-call shape
+        # working for integrations while all in-tree callers pass an int
+        # generation.
+        if generation is not None and not isinstance(generation, int):
+            if cookie_file is None:
+                cookie_file = generation
+            generation = None
+        if generation is None:
+            generation = self.load_generation
+        if generation != self.load_generation:
+            return False
+        self._current_play_uri = uri
+        self._current_play_uri_generation = generation
+        self._is_loading = True
+        self._start_position_timer()
         self._load_media_api()
+        if hasattr(self, "mpris_events"):
+            idx = self.current_queue_index
+            if 0 <= idx < len(self.queue):
+                track = self.queue[idx]
+                if track.get("thumb"):
+                    self._sync_mpris_art(track.get("thumb"), track.get("videoId"))
         if hasattr(self, "mpris_server"):
             self.mpris_server.publish()
-
-        return False
+        if self._pipeline_shutdown:
+            self._is_loading = False
+            return GLib.SOURCE_REMOVE
+        self._queue_pipeline_command("play", generation, uri)
+        return GLib.SOURCE_REMOVE
 
     def play(self):
-        self.player.set_state(Gst.State.PLAYING)
+        # A new track may still be resolving while the old pipeline is being
+        # flushed.  Replaying the old URI (or starting another load) during
+        # that window races the generation-aware resolver.
+        if self._is_loading:
+            return
+        # If a previous asynchronous load left playbin at NULL, setting
+        # PLAYING alone cannot recover because the URI handoff may not have
+        # completed.  Re-submit the complete serialized transaction instead.
+        try:
+            state = self.player.get_state(0)[1]
+        except Exception:
+            state = Gst.State.NULL
+        if state == Gst.State.NULL:
+            if (
+                self.current_video_id
+                and 0 <= self.current_queue_index < len(self.queue)
+                and self._current_play_uri
+                and getattr(self, "_current_play_uri_generation", None)
+                == self.load_generation
+            ):
+                self._queue_pipeline_command(
+                    "play", self.load_generation, self._current_play_uri
+                )
+            elif self.queue:
+                self._play_current_index()
+            else:
+                return
+        else:
+            self._queue_pipeline_command("resume", self.load_generation)
         self._update_logical_state()
 
     def pause(self):
-        self.player.set_state(Gst.State.PAUSED)
+        self._queue_pipeline_command("pause", self.load_generation)
         self._update_logical_state()
 
     def stop(self):
         if hasattr(self, "mpris_server"):
             self.mpris_server.unpublish()
-        
-        self.player.set_state(Gst.State.NULL)
+
+        # Invalidate every outstanding URL/worker callback before queuing
+        # the flush.  Without this, a late yt-dlp completion from the old
+        # track could enqueue PLAYING again after the user pressed stop.
+        with self._generation_lock:
+            self.load_generation += 1
+            stop_generation = self.load_generation
+            self._pipeline_generation = None
+            self._stream_started_generation = None
+            self._pending_gapless_index = None
+            self._pending_gapless_generation = None
+        self._pipeline_started_at = 0.0
+        self._pipeline_null_confirmed.clear()
+        self._cancel_staging_jobs("stop")
+        self._cancel_precache("stop")
+        if self._current_tmpfs_path:
+            self._defer_tmpfs_cleanup(self._current_tmpfs_path)
+        self._queue_pipeline_command("stop", stop_generation)
+        self._stop_position_timer()
         self._is_loading = False
-        self._pending_gapless_index = None
         self._seek_after_load = None
-        # Force stopped state immediately
+        self._pending_seek = None
+        self._pending_stream_cache = None
+        self._last_position_seconds = 0.0
+        self._last_duration_seconds = 0.0
+        self._track_started_at = 0.0
+        self._used_cached_url = False
+        self._fallback_stream_url = None
+        self._cache_failed_waiting = False
+        # Force stopped state immediately; the worker will finish the actual
+        # pipeline flush off the UI thread.
         if self._current_logical_state != "stopped":
             self._current_logical_state = "stopped"
             self.emit("state-changed", "stopped")
@@ -2269,11 +3723,17 @@ class Player(GObject.Object):
             elif state == Gst.State.PAUSED:
                 new_state = "paused"
 
+        # During a load, the old pipeline may still report PLAYING/PAUSED
+        # while the serialized worker is flushing it.  Do not let that stale
+        # state overwrite the explicit loading state; STATE_CHANGED/
+        # BUFFERING will clear _is_loading when the new source is ready.
+        if self._is_loading:
+            return
         if new_state != self._current_logical_state:
             self._current_logical_state = new_state
             try:
                 GLib.idle_add(self.emit, "state-changed", new_state)
-            except Exception as e:
+            except Exception:
                 pass
 
     def _dispatch_spectrum_message(self, structure):
@@ -2313,10 +3773,9 @@ class Player(GObject.Object):
             stream_time_ns = -1
 
         self._viz_queue.append((int(stream_time_ns), bands))
-        # Cap the buffer to ~3s at 30Hz. Anything older than that is
-        # either past the play-head (will be trimmed on next pull) or
-        # so far ahead the user has already navigated past it.
-        while len(self._viz_queue) > 90:
+        # The deque is already bounded; keep this guard for safety if a
+        # caller replaces it with a plain list in a test.
+        while len(self._viz_queue) > 64:
             self._viz_queue.popleft()
 
     def pull_visualizer_bands(self):
@@ -2369,9 +3828,54 @@ class Player(GObject.Object):
 
         return latest
 
+    def _ready_message_is_too_early(self):
+        """Whether a PLAYING/ASYNC_DONE message predates this URI."""
+        if self._stream_started_generation == self.load_generation:
+            return False
+        if self._stream_started_generation is not None:
+            return True
+        started = self._pipeline_started_at
+        return bool(started and time.monotonic() - started < 2.0)
+
     def on_message(self, bus, message):
+        if self._pipeline_shutdown:
+            return
         t = message.type
+        # Bus messages can outlive the source that produced them.  Source
+        # elements are tagged during source-setup; an old tagged message must
+        # not consume the current track's retry/cache state.
+        try:
+            with self._source_generation_lock:
+                message_generation = self._source_generations.get(message.src)
+                if message_generation is None:
+                    message_generation = self._source_generations.get(
+                        id(message.src), self._pipeline_generation
+                    )
+        except Exception:
+            message_generation = self._pipeline_generation
+        if (
+            message_generation is not None
+            and message_generation != self.load_generation
+        ):
+            return
+        if (
+            t in (
+                Gst.MessageType.STATE_CHANGED,
+                Gst.MessageType.ASYNC_DONE,
+                Gst.MessageType.EOS,
+            )
+            and message.src == self.player
+            and self._pipeline_generation is None
+            and self._is_loading
+        ):
+            return
         if t == Gst.MessageType.STREAM_START:
+            self._stream_started_generation = (
+                message_generation
+                if message_generation is not None
+                else self.load_generation
+            )
+            self._pipeline_started_at = 0.0
             # Fired when playbin starts a new stream — for gapless this is
             # the precise moment the pipeline switched to the uri we set
             # in _on_about_to_finish. Catch up our state on the main thread.
@@ -2381,8 +3885,30 @@ class Player(GObject.Object):
                     f"{self._pending_gapless_index}",
                     flush=True,
                 )
-                GLib.idle_add(self._apply_gapless_transition)
+                GLib.idle_add(
+                    self._apply_gapless_transition,
+                    self._pending_gapless_generation,
+                )
                 return
+        if t == Gst.MessageType.BUFFERING:
+            try:
+                percent = int(message.parse_buffering())
+            except Exception:
+                percent = 100
+            if percent < 100:
+                if not self._buffering_since:
+                    self._buffering_since = time.monotonic()
+                if not self._is_loading:
+                    self._current_logical_state = "loading"
+                    self.emit("state-changed", "loading")
+                self._is_loading = True
+                self._start_position_timer()
+            else:
+                self._buffering_since = 0.0
+                self._is_loading = False
+                self._next_duration_probe = 0.0
+                self._update_logical_state()
+            return
         if t == Gst.MessageType.EOS:
             # Ignore EOS that arrives mid-load. When the user skips rapidly,
             # GStreamer can emit EOS for the *previous* stream as it tears
@@ -2411,7 +3937,17 @@ class Player(GObject.Object):
             else:
                 GObject.idle_add(self.next)
         elif t == Gst.MessageType.ASYNC_DONE:
-            # The stream is actually loaded and ready
+            if self._ready_message_is_too_early():
+                return
+            # The stream is actually loaded and ready.  Reset recovery state
+            # here, not on the earlier PLAYING state transition: playbin can
+            # report PLAYING before it has produced a decodable buffer.
+            self._next_duration_probe = 0.0
+            self._stream_retry_count = 0
+            self._stall_recovery_active = False
+            self._is_loading = False
+            self._commit_pending_stream_cache()
+            self._start_position_timer()
             if hasattr(self, "mpris_events"):
                 self.mpris_events.on_player_all()  # Refresh duration and status
             # The seek-fallback parked a target here: now that the local file
@@ -2421,6 +3957,12 @@ class Player(GObject.Object):
                 pos = self._seek_after_load
                 self._seek_after_load = None
                 GLib.idle_add(self.seek, pos)
+            pending = self._pending_seek
+            if pending is not None:
+                pending_generation, pos, flush = pending
+                self._pending_seek = None
+                if pending_generation == self.load_generation:
+                    GLib.idle_add(self.seek, pos, flush)
         elif t == Gst.MessageType.ELEMENT:
             # Spectrum analyzer posts magnitude data here on every interval.
             structure = message.get_structure()
@@ -2429,23 +3971,34 @@ class Player(GObject.Object):
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"Error: {err}, {debug}")
+            error_generation = (
+                message_generation
+                if message_generation is not None
+                else self.load_generation
+            )
 
             # If cached URL failed, try the fresh yt-dlp resolved URL
             if self._used_cached_url:
+                if self._current_tmpfs_path:
+                    self._defer_tmpfs_cleanup(self._current_tmpfs_path)
                 fallback = getattr(self, "_fallback_stream_url", None)
                 self._used_cached_url = False
                 if fallback:
                     print("[CACHE] Cached URL failed, using fresh URL")
                     self._fallback_stream_url = None
                     if self.current_video_id:
-                        self.stream_cache.put(self.current_video_id, fallback)
-                    self._start_playback(fallback)
+                        self._pending_stream_cache = (
+                            error_generation,
+                            self.current_video_id,
+                            fallback,
+                        )
+                    self._start_playback(fallback, generation=error_generation)
                     return
                 else:
                     # yt-dlp hasn't finished yet - flag so it plays when ready
                     print("[CACHE] Cached URL failed, waiting for yt-dlp...")
                     self._cache_failed_waiting = True
-                    self.player.set_state(Gst.State.NULL)
+                    self._queue_pipeline_command("stop", error_generation)
                     return
 
             # Fresh yt-dlp URLs can still 503 because googlevideo rotates
@@ -2457,10 +4010,10 @@ class Player(GObject.Object):
             vid = self.current_video_id
             if (
                 vid
-                and self._stream_retry_count < self._stream_retry_max
-                and not self._is_loading
+                and getattr(self, "_stream_retry_count", 0)
+                < getattr(self, "_stream_retry_max", 2)
             ):
-                self._stream_retry_count += 1
+                self._stream_retry_count = getattr(self, "_stream_retry_count", 0) + 1
                 print(
                     f"[PLAYER] stream error (attempt "
                     f"{self._stream_retry_count}/{self._stream_retry_max}), "
@@ -2470,7 +4023,8 @@ class Player(GObject.Object):
                     self.stream_cache.invalidate(vid)
                 except Exception:
                     pass
-                self.player.set_state(Gst.State.NULL)
+                if self._current_tmpfs_path:
+                    self._defer_tmpfs_cleanup(self._current_tmpfs_path)
                 # Kick off a fresh yt-dlp resolution on a background
                 # thread; when it lands, `_fetch_and_play` will call
                 # _start_playback with the new URL.
@@ -2478,8 +4032,21 @@ class Player(GObject.Object):
                 if 0 <= idx < len(self.queue):
                     track = self.queue[idx]
                     self._is_loading = True
-                    self.load_generation += 1
-                    gen = self.load_generation
+                    with self._generation_lock:
+                        self.load_generation += 1
+                        retry_generation = self.load_generation
+                    self._pipeline_generation = None
+                    self._stream_started_generation = None
+                    self._pipeline_started_at = 0.0
+                    self._pipeline_null_confirmed.clear()
+                    self._current_play_uri = None
+                    self._current_play_uri_generation = None
+                    self._cancel_staging_jobs("stream retry")
+                    self._cancel_precache("stream retry")
+                    # Flush the failed source under its old generation so
+                    # the worker cannot clear the new retry's loading state.
+                    self._queue_pipeline_command("stop", error_generation)
+                    gen = retry_generation
                     threading.Thread(
                         target=self._fetch_and_play,
                         args=(
@@ -2494,13 +4061,17 @@ class Player(GObject.Object):
                     ).start()
                     return
 
-            self.player.set_state(Gst.State.NULL)
+            if self._current_tmpfs_path:
+                self._defer_tmpfs_cleanup(self._current_tmpfs_path)
+            self._queue_pipeline_command("stop", error_generation)
             self._is_loading = False
             self._update_logical_state()
         elif t == Gst.MessageType.STATE_CHANGED:
             if message.src == self.player:
                 old, new, pending = message.parse_state_changed()
                 if new == Gst.State.PLAYING:
+                    if self._ready_message_is_too_early():
+                        return
                     if self._user_volume == None:
                         self._user_volume = self.get_volume()
 
@@ -2514,18 +4085,37 @@ class Player(GObject.Object):
                         self.player.set_property("volume", linear)
                         self._internal_volume_change = False
                     self._is_loading = False
+                    self._commit_pending_stream_cache()
+                    self._buffering_since = 0.0
+                    self._last_progress_at = 0.0
+                    self._last_progress_position = 0
+                    self._start_position_timer()
+                    self._next_duration_probe = 0.0
                     import time as _time
                     self._track_started_at = _time.time()
                     if getattr(self, "discord_rpc", None):
                         self.discord_rpc.update()
+                elif new == Gst.State.PAUSED:
+                    self._stop_position_timer()
                 self._update_logical_state()
-        # BUFFERING messages are intentionally ignored - playbin manages
-        # stream buffering internally and briefly pauses the pipeline,
-        # which would cause the spinner to flash unnecessarily.
+        # Buffering is handled above so a source that never reaches 100% can
+        # be recovered instead of leaving the player apparently stuck.
 
     def get_state_string(self):
         """Returns the current logical player state."""
         return self._current_logical_state
+
+    def get_position_snapshot(self):
+        """Return the last emitted position/duration for a newly mapped view."""
+        return (
+            float(getattr(self, "_last_position_seconds", 0.0)),
+            float(
+                max(
+                    getattr(self, "_last_duration_seconds", 0.0),
+                    getattr(self, "duration", 0.0),
+                )
+            ),
+        )
 
     def _publish_mpris_art_pixbuf(self, pixbuf, video_id):
         """Center-crop a pixbuf to a square and upscale small art before
@@ -2572,7 +4162,10 @@ class Player(GObject.Object):
         return target_path
 
     def _sync_mpris_art(self, url, video_id):
-        """Downloads, crops, and saves artwork locally for MPRIS with fallback support."""
+        """Download/crop artwork only when an MPRIS server needs it."""
+
+        if not hasattr(self, "mpris_events"):
+            return
         def job(current_url, fallbacks=None):
             # Try local cover first (works offline). Downloads embed the cover
             # in the audio file's tags (no sidecar cover.jpg), so reuse the
@@ -2667,24 +4260,144 @@ class Player(GObject.Object):
         thread = threading.Thread(target=job, args=(url,), daemon=True)
         thread.start()
 
+    def _recover_stalled_stream(self, reason="stalled"):
+        """Re-resolve a source that never produced a moving audio clock."""
+
+        if self._stall_recovery_active or self.current_video_id is None:
+            return
+        if self._current_logical_state == "paused":
+            return
+        idx = self.current_queue_index
+        if not (0 <= idx < len(self.queue)):
+            return
+        track = self.queue[idx]
+        vid = self.current_video_id
+        self._stall_recovery_active = True
+        if getattr(self, "_stream_retry_count", 0) >= getattr(
+            self, "_stream_retry_max", 2
+        ):
+            self._stall_recovery_active = False
+            if self._current_tmpfs_path:
+                self._defer_tmpfs_cleanup(self._current_tmpfs_path)
+            self._queue_pipeline_command("stop", self.load_generation)
+            self._is_loading = False
+            self._current_logical_state = "stopped"
+            GLib.idle_add(self.emit, "state-changed", "stopped")
+            return
+        self._stream_retry_count = getattr(self, "_stream_retry_count", 0) + 1
+        print(
+            f"[PLAYBACK] {reason}; re-resolving {vid} "
+            f"(attempt {self._stream_retry_count})"
+        )
+        try:
+            self.stream_cache.invalidate(vid)
+        except Exception:
+            pass
+
+        if self._current_tmpfs_path:
+            self._defer_tmpfs_cleanup(self._current_tmpfs_path)
+        with self._generation_lock:
+            previous_generation = self.load_generation
+            self.load_generation += 1
+            generation = self.load_generation
+        self._pipeline_generation = None
+        self._stream_started_generation = None
+        self._pipeline_started_at = 0.0
+        self._pipeline_null_confirmed.clear()
+        self._current_play_uri = None
+        self._current_play_uri_generation = None
+        self._cancel_staging_jobs("stall recovery")
+        self._cancel_precache("stall recovery")
+        self._is_loading = True
+        self._buffering_since = 0.0
+        self._last_progress_at = 0.0
+        self._queue_pipeline_command("stop", previous_generation)
+        self._start_position_timer()
+
+        def _resolve():
+            try:
+                self._fetch_and_play(
+                    vid,
+                    track.get("title", ""),
+                    track.get("artist", ""),
+                    track.get("thumb"),
+                    track.get("likeStatus", "INDIFFERENT"),
+                    generation,
+                )
+            finally:
+                self._stall_recovery_active = False
+
+        threading.Thread(target=_resolve, name="ventapes-stream-recovery", daemon=True).start()
+
+    def _start_position_timer(self):
+        if self._position_timer_id or self._pipeline_shutdown:
+            return
+        self._position_timer_id = GObject.timeout_add(
+            self._progress_interval_ms, self.update_position
+        )
+
+    def _stop_position_timer(self):
+        source = self._position_timer_id
+        self._position_timer_id = 0
+        if source:
+            try:
+                GLib.source_remove(source)
+            except Exception:
+                pass
+
+    def _restart_position_timer(self):
+        self._stop_position_timer()
+        self._start_position_timer()
+
     def update_position(self):
         import time
 
         now = time.time()
-
-        # 1. Protection during seek/load
-        # If we are loading or just sought, don't trust GStreamer yet
-        if self._is_loading or (now - self.last_seek_time < 0.8):
+        monotonic_now = time.monotonic()
+        if self._is_loading:
+            if self._buffering_since and monotonic_now - self._buffering_since > 12.0:
+                self._recover_stalled_stream("buffering timeout")
+            return True
+        if now - self.last_seek_time < 0.8:
             return True
 
         ret, state, pending = self.player.get_state(0)
-        if state in [Gst.State.PLAYING, Gst.State.PAUSED]:
-            # 2. Update Duration if it changed (vital for MPRIS progress bar scale).
-            # Only trust a POSITIVE duration from GStreamer — some upload-song
-            # streams return success=True with dur_nanos=0 on the first ticks
-            # (and sometimes throughout, when YT's locker endpoint doesn't
-            # advertise a length). Treat those as unknown and fall through to
-            # the metadata fallback.
+        if state not in (Gst.State.PLAYING, Gst.State.PAUSED):
+            # No reason to wake the main loop while stopped.  A later
+            # STATE_CHANGED/PLAYING event starts the timer again.
+            self._position_timer_id = 0
+            return False
+
+        if state == Gst.State.PLAYING:
+            try:
+                progress_ok, progress_ns = self.player.query_position(Gst.Format.TIME)
+            except Exception:
+                progress_ok, progress_ns = False, 0
+            if self._buffering_since and monotonic_now - self._buffering_since > 12.0:
+                self._recover_stalled_stream("buffering timeout")
+                return True
+            if (
+                progress_ok
+                and self._last_progress_at
+                and abs(progress_ns - self._last_progress_position) < 100_000
+                and monotonic_now - self._last_progress_at > 8.0
+            ):
+                self._recover_stalled_stream("position stalled")
+                return True
+            if progress_ok:
+                if not self._last_progress_at or abs(
+                    progress_ns - self._last_progress_position
+                ) >= 100_000:
+                    self._last_progress_at = monotonic_now
+                    self._last_progress_position = progress_ns
+
+        # Querying duration on every 100 ms tick is surprisingly expensive
+        # for streaming sources.  It changes only when a source prerolls, so
+        # once per second is sufficient; ASYNC_DONE/state changes reset the
+        # probe immediately.
+        monotonic_now = time.monotonic()
+        if monotonic_now >= self._next_duration_probe:
+            self._next_duration_probe = monotonic_now + 1.0
             new_dur = None
             success_dur, dur_nanos = self.player.query_duration(Gst.Format.TIME)
             if success_dur and dur_nanos > 0:
@@ -2694,15 +4407,12 @@ class Player(GObject.Object):
                 if abs(new_dur - self.duration) > 0.1:
                     self.duration = new_dur
                     if hasattr(self, "mpris_events"):
-                        self.mpris_events.on_title()  # Syncs 'mpris:length'
+                        self.mpris_events.on_title()
                     if getattr(self, "discord_rpc", None):
                         self.discord_rpc.update()
             elif self.duration <= 0:
                 # GStreamer doesn't know the length yet — use the track's
                 # metadata so the seek bar has a range to drag inside.
-                # Uploaded songs from get_library_upload_songs() only
-                # carry `duration` as "M:SS" string (no `duration_seconds`),
-                # so check both.
                 if 0 <= self.current_queue_index < len(self.queue):
                     track = self.queue[self.current_queue_index]
                     meta_dur = _parse_track_duration(track)
@@ -2711,67 +4421,64 @@ class Player(GObject.Object):
                         if hasattr(self, "mpris_events"):
                             self.mpris_events.on_title()
 
-            # 3. Update Position
-            success_pos, pos_nanos = self.player.query_position(Gst.Format.TIME)
-            if success_pos:
-                current_time = pos_nanos / Gst.SECOND
+        success_pos, pos_nanos = self.player.query_position(Gst.Format.TIME)
+        if not success_pos:
+            return True
+        current_time = pos_nanos / Gst.SECOND
+        duration = self.duration if self.duration > 0 else 0.0
+        self._last_position_seconds = float(current_time)
+        self._last_duration_seconds = float(duration)
 
-                # Update the Adapter's cache immediately
-                if hasattr(self, "mpris_adapter"):
-                    self.mpris_adapter._last_pos = pos_nanos // 1000
+        # The seek bar only needs a few updates per second.  Avoid waking
+        # every connected view when the position has not materially moved.
+        if (
+            abs(current_time - self._last_emitted_position) >= 0.08
+            or abs(duration - self._last_emitted_duration) >= 0.1
+        ):
+            self._last_emitted_position = current_time
+            self._last_emitted_duration = duration
+            if hasattr(self, "mpris_adapter"):
+                self.mpris_adapter._last_pos = pos_nanos // 1000
+            self.emit("progression", float(current_time), float(duration))
 
-                # 4. Emit progression for local UI
-                # We use float(d) to ensure the UI progress bar has a max value
-                d = self.duration if self.duration > 0 else 0
-                self.emit("progression", float(current_time), float(d))
+        # The scrobbler uses the real pipeline state and should still see
+        # every timer tick; it performs no network work unless a threshold
+        # or now-playing refresh is due.
+        if getattr(self, "scrobbler", None):
+            self.scrobbler.on_progress(
+                float(current_time), float(duration), state == Gst.State.PLAYING
+            )
 
-                # Drive the scrobbler from here rather than the signal: this
-                # is the only place with the pipeline's true state, and the
-                # bus reports no transition when a queue plays straight
-                # through (set_state(NULL) flushes those messages).
-                if getattr(self, "scrobbler", None):
-                    self.scrobbler.on_progress(
-                        float(current_time), float(d), state == Gst.State.PLAYING
-                    )
-
-                # 5. Record a listen after the threshold, but only in
-                # `after_30s` mode. "immediate" is handled in
-                # `_load_internal`; "never" skips recording entirely.
-                vid = getattr(self, "current_video_id", None)
-                if (
-                    self._history_mode == "after_30s"
-                    and vid
-                    and self._history_recorded_for != vid
-                    and state == Gst.State.PLAYING
-                    and current_time >= self._history_record_after_sec
-                ):
-                    self._history_recorded_for = vid
-                    print(
-                        f"[HISTORY] {self._history_record_after_sec}s threshold "
-                        f"hit for {vid} — recording play"
-                    )
-                    try:
-                        self.client.add_history_item_async(vid)
-                    except Exception as e:
-                        print(f"[HISTORY] failed to record {vid}: {e}")
+        vid = getattr(self, "current_video_id", None)
+        if (
+            self._history_mode == "after_30s"
+            and vid
+            and self._history_recorded_for != vid
+            and state == Gst.State.PLAYING
+            and current_time >= self._history_record_after_sec
+        ):
+            self._history_recorded_for = vid
+            print(
+                f"[HISTORY] {self._history_record_after_sec}s threshold "
+                f"hit for {vid} — recording play"
+            )
+            try:
+                self.client.add_history_item_async(vid)
+            except Exception as e:
+                print(f"[HISTORY] failed to record {vid}: {e}")
 
         return True
 
     def _load_history_mode(self):
         """Read the user's history-recording preference. Defaults to
         "immediate" so we match YT Music's own behavior out of the box."""
-        import json
-        import os
         try:
-            path = os.path.join(
-                GLib.get_user_data_dir(), "ventapes", "prefs.json"
+            mode = read_prefs(user_prefs_path(), {}).get(
+                "history_mode", "immediate"
             )
-            if os.path.exists(path):
-                with open(path) as f:
-                    return json.load(f).get("history_mode", "immediate")
+            return mode if mode in ("immediate", "after_30s", "never") else "immediate"
         except Exception:
-            pass
-        return "immediate"
+            return "immediate"
 
 
     def set_history_mode(self, mode):
@@ -2786,10 +4493,23 @@ class Player(GObject.Object):
         """Seek to position in seconds. Returns True on success, False on
         failure (e.g. the stream doesn't support range requests — common
         for YT Music upload-locker URLs)."""
-        if self.player.get_state(0)[1] == Gst.State.NULL:
-            return False
 
         import time
+
+        try:
+            position = max(0.0, float(position))
+        except (TypeError, ValueError):
+            return False
+        if self.duration > 0:
+            position = min(position, float(self.duration))
+        generation = self.load_generation
+        state = self.player.get_state(0)[1]
+        if state == Gst.State.NULL or self._is_loading:
+            # A seek made while a new URI is prerolling is valid; park it
+            # for the matching ASYNC_DONE instead of dropping it on the
+            # floor.  The generation prevents it leaking onto a later track.
+            self._pending_seek = (generation, position, bool(flush))
+            return False
 
         self.last_seek_time = time.time()
         # Drop any spectrum entries queued before this seek — their
@@ -2797,9 +4517,6 @@ class Player(GObject.Object):
         # (backward seek), either way they mislead pull_visualizer_bands.
         self._viz_queue.clear()
 
-        # Check whether the pipeline reports as seekable BEFORE attempting.
-        # This is cheap, and lets us avoid trying a seek that we know will
-        # silently fail — letting on_scale_change_value know not to bother.
         seekable = False
         try:
             q = Gst.Query.new_seeking(Gst.Format.TIME)
@@ -2807,6 +4524,10 @@ class Player(GObject.Object):
                 _, seekable, _, _ = q.parse_seeking()
         except Exception:
             seekable = True  # be permissive — try anyway
+
+        if not seekable:
+            self._begin_seek_fallback(position)
+            return False
 
         flags = Gst.SeekFlags.ACCURATE
         if flush:
@@ -2832,20 +4553,17 @@ class Player(GObject.Object):
                 f"[PLAYER] seek to {position:.1f}s rejected by pipeline "
                 f"(seekable={seekable}, vid={self.current_video_id})"
             )
-            # The stream won't seek (typically a progressive m4a with no
-            # usable seek index). Remember it and recover by downloading the
-            # track into tmpfs and resuming there — local files seek fine.
             self._begin_seek_fallback(position)
             return False
 
+        self._pending_seek = None
         if hasattr(self, "mpris_events"):
             self.mpris_events.on_seek(int(position * 1_000_000))
         return True
 
     def _begin_seek_fallback(self, position):
-        """Download the current track to tmpfs and resume at `position` once
-        it's local — recovery for streams GStreamer can't seek. Only runs for
-        network streams (local/tmpfs playback already seeks), once at a time."""
+        """Download the current track locally after a rejected seek."""
+
         vid = self.current_video_id
         if not vid:
             return
@@ -2853,50 +4571,58 @@ class Player(GObject.Object):
         # range support and a re-download won't help — don't loop.
         if self._current_tmpfs_path:
             return
+        gen = self.load_generation
         if self._seek_fallback_active:
-            # A download is already in flight; just update the target so we
-            # land where the user most recently aimed.
-            self._seek_after_load = position
+            if self._seek_fallback_generation == gen:
+                # A download is already in flight; keep the newest target.
+                self._seek_after_load = position
+            else:
+                # The old download is being cancelled by the track change.
+                # Do not lose this newer seek while its worker unwinds.
+                self._pending_seek_fallback = (vid, position, gen)
+                self._seek_after_load = position
             return
 
+        self._start_seek_fallback(vid, position, gen)
+
+    def _start_seek_fallback(self, vid, position, gen):
+        if gen != self.load_generation or self._current_tmpfs_path:
+            return
         self._mark_noseek(vid)
         self._seek_fallback_active = True
+        self._seek_fallback_generation = gen
         self._seek_after_load = position
-        gen = self.load_generation
-        print(f"[PLAYER] seek fallback: downloading {vid} to tmpfs to enable seeking")
+        self._pending_seek = None
+        print(f"[PLAYER] seek fallback: downloading {vid} to local staging")
 
         def _worker():
             try:
                 tmpfs_path = self._download_upload_to_tmpfs(vid, gen)
-                if not tmpfs_path or gen != self.load_generation:
-                    if tmpfs_path:
-                        self._cleanup_tmpfs_path(tmpfs_path)
-                    return
-                GLib.idle_add(self._swap_to_tmpfs, tmpfs_path, vid, gen)
+                if tmpfs_path and gen == self.load_generation:
+                    GObject.idle_add(self._swap_to_tmpfs, tmpfs_path, vid, gen)
+                elif tmpfs_path:
+                    self._cleanup_tmpfs_path(tmpfs_path)
             finally:
                 self._seek_fallback_active = False
+                self._seek_fallback_generation = None
+                pending = self._pending_seek_fallback
+                self._pending_seek_fallback = None
+                if pending and pending[2] == self.load_generation:
+                    GObject.idle_add(
+                        self._begin_seek_fallback, pending[1]
+                    )
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _swap_to_tmpfs(self, tmpfs_path, vid, gen):
-        """Main-thread: switch playback from the unseekable stream to the
-        freshly downloaded local file, parking the desired seek for
-        ASYNC_DONE to apply."""
-        if gen != self.load_generation or vid != self.current_video_id:
-            self._cleanup_tmpfs_path(tmpfs_path)
-            return False
-        # Replace any previous tmpfs buffer.
-        if self._current_tmpfs_path and self._current_tmpfs_path != tmpfs_path:
-            self._cleanup_tmpfs_path(self._current_tmpfs_path)
-        self._current_tmpfs_path = tmpfs_path
-        self._stream_debug = {
-            "source": "local tmpfs (non-seekable stream fallback)",
-            "video_id": vid,
-            "path": tmpfs_path,
-        }
-        file_uri = GLib.filename_to_uri(os.path.abspath(tmpfs_path), None)
-        self._start_playback(file_uri)
-        return False
+        """Main-thread adoption of a completed seek-fallback download."""
+
+        return self._adopt_staged_path(
+            tmpfs_path,
+            vid,
+            gen,
+            source="local staged (non-seekable stream fallback)",
+        )
 
     def get_stream_debug(self, full=False):
         """Build a human-readable snapshot of the current stream + pipeline

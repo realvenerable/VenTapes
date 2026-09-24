@@ -1,8 +1,8 @@
 # VenTapes (modified 2026-09-24) is based on Mixtapes and remains GPL-3.0-or-later.
 # See ../../NOTICE.md and ../../CREDITS.md.
 
-import json
 import os
+import json
 import queue
 import socket
 import struct
@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import uuid
+
+from ui.preferences import get_bool, read_prefs, user_prefs_path
 
 
 DISCORD_APP_ID = os.environ.get("VENTAPES_DISCORD_APP_ID", "").strip()
@@ -31,31 +33,31 @@ STATUS_DISPLAY_DEFAULT = "artist"
 
 
 def _get_prefs():
-    from gi.repository import GLib
-    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     try:
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
+        return read_prefs(user_prefs_path(), {})
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def get_rpc_enabled():
-    return _get_prefs().get("discord_rpc_enabled", False)
+    return get_bool(_get_prefs(), "discord_rpc_enabled", False)
 
 
 def get_status_display_type():
-    return _get_prefs().get("discord_rpc_status_display", STATUS_DISPLAY_DEFAULT)
+    value = _get_prefs().get("discord_rpc_status_display", STATUS_DISPLAY_DEFAULT)
+    return value if isinstance(value, str) and value in STATUS_DISPLAY_TYPES else STATUS_DISPLAY_DEFAULT
 
 
 def get_small_icon_enabled():
-    return _get_prefs().get("discord_rpc_small_icon_enabled", True)
+    return get_bool(
+        _get_prefs(), "discord_rpc_small_icon_enabled", True
+    )
 
 
 def get_hide_pause_enabled():
-    return _get_prefs().get("discord_rpc_hide_pause_enabled", False)
+    return get_bool(
+        _get_prefs(), "discord_rpc_hide_pause_enabled", False
+    )
 
 OP_HANDSHAKE = 0
 OP_FRAME = 1

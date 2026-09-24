@@ -1,10 +1,12 @@
 import os
+import tempfile
 import threading
 import time
 import weakref
 import collections
 import re
 from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
+from ui.preferences import get_bool, read_prefs, user_prefs_path
 import gc
 import ctypes
 import sys
@@ -42,6 +44,7 @@ _FORCE_OFFLINE_CACHE = {"value": False, "expires": 0.0}
 _FORCE_OFFLINE_TTL = 10.0
 
 _ACTIVE_LIKE_BUTTONS = weakref.WeakSet()
+_WEAK_SIGNAL_CLEANUPS = {}
 
 def _check_force_offline():
     """Return the force_offline pref, cached for ``_FORCE_OFFLINE_TTL``
@@ -49,13 +52,11 @@ def _check_force_offline():
     now = time.monotonic()
     if now < _FORCE_OFFLINE_CACHE["expires"]:
         return _FORCE_OFFLINE_CACHE["value"]
-    import json
-    prefs_path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     result = False
     try:
-        if os.path.exists(prefs_path):
-            with open(prefs_path) as f:
-                result = bool(json.load(f).get("force_offline"))
+        result = get_bool(
+            read_prefs(user_prefs_path(), {}), "force_offline", False
+        )
     except Exception:
         pass
     _FORCE_OFFLINE_CACHE["value"] = result
@@ -213,7 +214,7 @@ def _get_fetch_executor():
         if _FETCH_EXECUTOR is None:
             from concurrent.futures import ThreadPoolExecutor
             _FETCH_EXECUTOR = ThreadPoolExecutor(
-                max_workers=6, thread_name_prefix="ventapes-img"
+                max_workers=3, thread_name_prefix="ventapes-img"
             )
     return _FETCH_EXECUTOR
 
@@ -348,14 +349,48 @@ def write_thumb_cache(url, data):
     if not path:
         return
     try:
-        # Write to a sibling tmp file then rename so partial writes can never
-        # be read as valid cached bytes.
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
+        # Use a unique sibling temp file.  Several AsyncImage workers can
+        # discover the same thumbnail concurrently; a shared ``path.tmp``
+        # lets one worker replace or remove another worker's bytes.
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+        )
+        fd_open = True
+        try:
+            handle = os.fdopen(fd, "wb")
+            fd_open = False
+            with handle:
+                handle.write(data)
+            os.replace(tmp, path)
+        except Exception:
+            if fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError:
         pass
+
+
+def set_image_cache_limit(max_entries):
+    """Resize the decoded-art cache for the current power profile."""
+
+    global MAX_CACHE_SIZE
+    try:
+        limit = max(4, min(24, int(max_entries)))
+    except (TypeError, ValueError):
+        return MAX_CACHE_SIZE
+    MAX_CACHE_SIZE = limit
+    with IMG_CACHE_LOCK:
+        while len(IMG_CACHE) > MAX_CACHE_SIZE:
+            IMG_CACHE.popitem(last=False)
+    return MAX_CACHE_SIZE
 
 
 def cache_pixbuf(url, pixbuf):
@@ -409,6 +444,29 @@ def get_high_res_url(url, target_size=None):
         clean_url = url
 
     if "i.ytimg.com" in clean_url:
+        if target_size:
+            # Video thumbnails have fixed quality names rather than a
+            # width parameter.  Avoid downloading a 1280px master for a
+            # 44px queue row; the bounded decoder/cache would shrink it
+            # again anyway.
+            try:
+                requested = int(target_size) * 2
+            except (TypeError, ValueError):
+                requested = 0
+            if requested <= 240:
+                quality = "default"
+            elif requested <= 320:
+                quality = "mqdefault"
+            elif requested <= 480:
+                quality = "hqdefault"
+            elif requested <= 640:
+                quality = "sddefault"
+            else:
+                quality = "maxresdefault"
+            for q in _YTIMG_QUALITIES:
+                if q in clean_url:
+                    return clean_url.replace(q, quality)
+            return clean_url
         for q in _YTIMG_QUALITIES:
             if q in clean_url:
                 return clean_url.replace(q, "maxresdefault")
@@ -984,6 +1042,13 @@ class AsyncImage(Gtk.Image):
         
     def _on_destroy(self, *_):
         self._cancel_hidden_unload()
+        future = getattr(self, "_active_future", None)
+        if future is not None:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            self._active_future = None
         self._pending_fetch = None
         self.url = None
         self.video_id = None
@@ -1206,7 +1271,9 @@ class AsyncImage(Gtk.Image):
                 next_url = fallbacks.pop(0)
                 self.url = next_url
                 print(f"Trying fallback: {next_url}")
-                submit_fetch(self._fetch_image, next_url, fallbacks)
+                self._active_future = submit_fetch(
+                    self._fetch_image, next_url, fallbacks
+                )
 
     def _apply_pixbuf(self, pixbuf, url=None):
         # Race condition check: only apply if the URL hasn't changed since request
@@ -1387,6 +1454,13 @@ class AsyncPicture(Gtk.Picture):
 
     def _on_destroy(self, *_):
         self._cancel_hidden_unload()
+        future = getattr(self, "_active_future", None)
+        if future is not None:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            self._active_future = None
         self._pending_fetch = None
         self.url = None
         self.video_id = None
@@ -1447,8 +1521,14 @@ class AsyncPicture(Gtk.Picture):
     # for rationale. Identical mechanism, separate class because Gtk.Picture
     # and Gtk.Image don't share a base.
     def _queue_fetch(self, fn, *args):
+        if getattr(self, "_active_future", None):
+            try:
+                self._active_future.cancel()
+            except Exception:
+                pass
+            self._active_future = None
         if self.get_mapped():
-            submit_fetch(fn, *args)
+            self._active_future = submit_fetch(fn, *args)
             return
         self._pending_fetch = (fn, args)
         if not getattr(self, "_map_handler_id", None):
@@ -1462,7 +1542,7 @@ class AsyncPicture(Gtk.Picture):
         self._pending_fetch = None
         if args and args[0] != self.url:
             return
-        submit_fetch(fn, *args)
+        self._active_future = submit_fetch(fn, *args)
 
     def load_url(self, url, **kwargs):
         orig_url = url
@@ -1530,6 +1610,9 @@ class AsyncPicture(Gtk.Picture):
                 # Local file
                 import os
                 path = url[7:]
+                query = path.rfind("?")
+                if query != -1:
+                    path = path[:query]
                 if os.path.exists(path):
                     with open(path, "rb") as f:
                         data = f.read()
@@ -1581,7 +1664,9 @@ class AsyncPicture(Gtk.Picture):
                 next_url = fallbacks.pop(0)
                 self.url = next_url
                 print(f"Trying fallback: {next_url}")
-                submit_fetch(self._fetch_image, next_url, fallbacks)
+                self._active_future = submit_fetch(
+                    self._fetch_image, next_url, fallbacks
+                )
             else:
                 try:
                     local = self._get_local_cover()
@@ -1644,21 +1729,26 @@ class MarqueeLabel(Gtk.ScrolledWindow):
 
         self.connect("map", self._start_marquee)
         self.connect("unmap", self._stop_marquee)
+        self.connect("destroy", self._stop_marquee)
 
     def add_css_class(self, class_name):
         self.label1.add_css_class(class_name)
         self.label2.add_css_class(class_name)
 
     def _start_marquee(self, *args):
-        if self._tick_id == 0:
-            self._tick_id = self.add_tick_callback(self._on_tick)
+        if self._tick_id == 0 and self.get_mapped():
+            self._last_frame_time = time.monotonic() * 1_000_000.0
+            self._tick_id = GLib.timeout_add(33, self._on_tick)
 
     def _stop_marquee(self, *args):
         if self._tick_id != 0:
-            self.remove_tick_callback(self._tick_id)
+            try:
+                GLib.source_remove(self._tick_id)
+            except Exception:
+                pass
             self._tick_id = 0
 
-    def _on_tick(self, widget, frame_clock):
+    def _on_tick(self):
         width = self.get_width()
         label_w = self.label1.get_width()
 
@@ -1666,12 +1756,13 @@ class MarqueeLabel(Gtk.ScrolledWindow):
             self.label2.set_visible(False)
             self.get_hadjustment().set_value(0)
             self._is_animating = False
-            return True
+            self._stop_marquee()
+            return False
 
         self.label2.set_visible(True)
         self._is_animating = True
 
-        frame_time = frame_clock.get_frame_time()
+        frame_time = time.monotonic() * 1_000_000.0
         if not hasattr(self, "_last_frame_time"):
             self._last_frame_time = frame_time
             return True
@@ -1696,6 +1787,7 @@ class MarqueeLabel(Gtk.ScrolledWindow):
         self.get_hadjustment().set_value(0)
         if hasattr(self, "_last_frame_time"):
             delattr(self, "_last_frame_time")
+        self._start_marquee()
 
 
 def notify_like_changed(video_id, status):
@@ -1711,23 +1803,93 @@ def notify_like_changed(video_id, status):
     return GLib.SOURCE_REMOVE
 
 def bind_weak_signal(emitter, signal_name, lifecycle_obj, callback):
+    """Connect a lifecycle-bound signal without retaining a dead widget.
+
+    Bound methods are held through ``WeakMethod``.  Plain closures are kept
+    callable for compatibility, but call sites that close over a widget must
+    close over a weak reference (the page/card helpers do this); otherwise a
+    closure would reintroduce the retention path this helper is meant to
+    prevent.  The destroy connection makes teardown immediate instead of
+    waiting for the next player emission.
+    """
+
     weak_obj = weakref.ref(lifecycle_obj)
-    
-    handler_id = [None] 
+    if getattr(callback, "__self__", None) is not None:
+        try:
+            callback_ref = weakref.WeakMethod(callback)
+        except TypeError:
+            callback_ref = lambda value=callback: value
+    else:
+        callback_ref = lambda value=callback: value
+
+    handler_id = [None]
+    destroy_id = [None]
+    cleanup_key = [None]
+
+    def _disconnect(*_):
+        key = cleanup_key[0]
+        if key is not None:
+            _WEAK_SIGNAL_CLEANUPS.pop(key, None)
+            cleanup_key[0] = None
+        handler = handler_id[0]
+        if handler is not None:
+            try:
+                emitter.disconnect(handler)
+            except Exception:
+                pass
+            handler_id[0] = None
+        destroy = destroy_id[0]
+        if destroy is not None:
+            destroy_id[0] = None
+            # Do not close a lifecycle_obj <-> _disconnect reference cycle;
+            # a removed GTK page must become collectible without waiting for
+            # another player emission.
+            target = weak_obj()
+            if target is not None:
+                try:
+                    target.disconnect(destroy)
+                except Exception:
+                    pass
 
     def _wrapper(*args, **kwargs):
-        if weak_obj() is None:
-            if handler_id[0] is not None:
-                try:
-                    emitter.disconnect(handler_id[0])
-                except Exception as e:
-                    pass
+        target = weak_obj()
+        callback_fn = callback_ref()
+        if target is None or callback_fn is None:
+            _disconnect()
             return False
-            
-        return callback(*args, **kwargs)
+        return callback_fn(*args, **kwargs)
 
     handler_id[0] = emitter.connect(signal_name, _wrapper)
+    cleanup_key[0] = (id(emitter), handler_id[0])
+    _WEAK_SIGNAL_CLEANUPS[cleanup_key[0]] = _disconnect
+    try:
+        destroy_id[0] = lifecycle_obj.connect("destroy", _disconnect)
+    except Exception:
+        # Non-GObject test doubles/older wrappers may not expose a destroy
+        # signal; the weak checks in _wrapper still make that case safe.
+        destroy_id[0] = None
     return handler_id[0]
+
+
+def disconnect_weak_signal(emitter, handler_id):
+    """Disconnect a handler returned by :func:`bind_weak_signal`.
+
+    Calling ``emitter.disconnect(id)`` directly cannot remove the helper's
+    private lifecycle callback, so recycled rows/pages should use this
+    function instead.
+    """
+    if handler_id is None:
+        return False
+    cleanup = _WEAK_SIGNAL_CLEANUPS.pop((id(emitter), handler_id), None)
+    if cleanup is not None:
+        cleanup()
+        return True
+    try:
+        emitter.disconnect(handler_id)
+        return True
+    except Exception:
+        return False
+
 
 def force_garbage_collect():
     

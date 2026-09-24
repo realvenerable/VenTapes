@@ -128,7 +128,22 @@ def _apply_gsk_renderer_pref():
         return  # explicit env var wins
     try:
         import json
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        # GLib.get_user_data_dir() is platform-specific, but this function
+        # runs before GTK/GLib is imported so the renderer can still be
+        # selected early. Mirror the relevant platform locations here; the
+        # normal UI path continues to use GLib via user_prefs_path().
+        if sys.platform == "win32":
+            base = (
+                os.environ.get("LOCALAPPDATA")
+                or os.environ.get("APPDATA")
+                or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            )
+        elif sys.platform == "darwin":
+            base = os.path.expanduser("~/Library/Application Support")
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+                "~/.local/share"
+            )
         prefs_path = os.path.join(base, "ventapes", "prefs.json")
         if not os.path.exists(prefs_path):
             return

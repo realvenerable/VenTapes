@@ -1,40 +1,26 @@
 import os
-import json
 from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio, Pango
 
 from ui.context_menu import MenuAction, build_song_menu
+from ui.preferences import get_bool, read_prefs, update_prefs, user_prefs_path
 from ui.utils import AsyncPicture, LikeButton, MarqueeLabel, show_toast
 from ui.widgets.visualizer import Visualizer
 from ui.widgets.lyrics_view import LyricsView
 
 
-_PREFS_PATH = os.path.join(
-    GLib.get_user_data_dir(),
-    "ventapes",
-    "prefs.json",
-)
+_PREFS_PATH = user_prefs_path()
 
 
 def _load_pref(key, default):
     try:
-        if os.path.exists(_PREFS_PATH):
-            with open(_PREFS_PATH) as f:
-                return json.load(f).get(key, default)
+        return get_bool(read_prefs(_PREFS_PATH, {}), key, default)
     except Exception:
-        pass
-    return default
+        return default
 
 
 def _save_pref(key, value):
     try:
-        os.makedirs(os.path.dirname(_PREFS_PATH), exist_ok=True)
-        data = {}
-        if os.path.exists(_PREFS_PATH):
-            with open(_PREFS_PATH) as f:
-                data = json.load(f) or {}
-        data[key] = value
-        with open(_PREFS_PATH, "w") as f:
-            json.dump(data, f)
+        update_prefs(_PREFS_PATH, {key: value})
     except Exception:
         pass
 
@@ -422,7 +408,7 @@ class DesktopCoverView(Adw.Bin):
         self.player.connect("metadata-changed", self._on_metadata_changed)
         self.player.connect("volume-changed", self.on_volume_changed)
 
-        self.connect("map", lambda *_: self.update_visualizer_state())
+        self.connect("map", self._on_map)
 
         initial_lyrics = bool(_load_pref("lyrics_shown_desktop", False))
         if initial_lyrics:
@@ -434,6 +420,13 @@ class DesktopCoverView(Adw.Bin):
         if callable(self.on_queue_click):
             self.on_queue_click()
         self.emit("queue-requested")
+
+    def _on_map(self, *_):
+        self.update_visualizer_state()
+        self.on_state_changed(self.player, self.player.get_state_string())
+        if hasattr(self.player, "get_position_snapshot"):
+            pos, dur = self.player.get_position_snapshot()
+            self.on_progression(self.player, pos, dur)
 
     def update_visualizer_state(self):
         if hasattr(self, "visualizer") and hasattr(self.visualizer, "set_active"):
@@ -555,6 +548,8 @@ class DesktopCoverView(Adw.Bin):
         return f"{m}:{s:02d}"
 
     def on_progression(self, player, pos, dur):
+        if not self.get_mapped():
+            return
         if getattr(self, "_scroll_seek_id", None):
             return
         self.scale.set_range(0, dur)

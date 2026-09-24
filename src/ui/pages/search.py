@@ -6,6 +6,7 @@ from ui.context_menu import show_item_menu
 from ui.util_classes import ScrolledWindow
 from ui.widgets.scroll_box import HorizontalScrollBox
 from ui.widgets.media_card import MediaCardWidget
+from ui.preferences import read_prefs, update_prefs, user_prefs_path
 
 CARD_SIZE = 150
 
@@ -137,7 +138,8 @@ class SearchPage(Adw.Bin):
         self.spinner.set_size_request(32, 32)
         loading_box.append(self.spinner)
 
-        loading_label = Gtk.Label(label="Searching...")
+        self.loading_label = Gtk.Label(label="Searching...")
+        loading_label = self.loading_label
         loading_label.add_css_class("dim-label")
         loading_box.append(loading_label)
 
@@ -165,6 +167,7 @@ class SearchPage(Adw.Bin):
 
         self.set_child(box)
         self.search_timer = None
+        self._search_active = False
         self._result_toggles = []
 
         self.stack.set_visible_child_name("explore")
@@ -173,10 +176,12 @@ class SearchPage(Adw.Bin):
 
         self._explore_loaded = False
         self._explore_loading = False
+        self._explore_force_pending = False
+        self._explore_generation = 0
         self._explore_retry_count = 0
 
-        GLib.idle_add(self.load_explore_data)
-
+        # The map/visibility handler below loads Explore lazily; avoid
+        # fetching it while the other top-level tabs are still being built.
         self.loading_row_spinner = None
         self.player.connect("state-changed", self.on_player_state_changed)
 
@@ -229,6 +234,8 @@ class SearchPage(Adw.Bin):
         self._check_and_reset_if_empty()
 
     def _check_and_reset_if_empty(self):
+        if not self.get_mapped():
+            return
         entry = getattr(self, "search_entry", None)
         text = ""
         if entry and hasattr(entry, "get_text"):
@@ -268,7 +275,7 @@ class SearchPage(Adw.Bin):
         self._propagate_compact(self.results_stack, compact)
         self._propagate_compact(self.explore_box, compact)
 
-        if not self._explore_loaded:
+        if self.get_mapped() and not self._explore_loaded:
             self.load_explore_data()
 
     def _propagate_compact(self, widget, compact):
@@ -286,6 +293,11 @@ class SearchPage(Adw.Bin):
                 self.search_entry.grab_focus()
                 return controller.forward(self.search_entry)
         return False
+
+    def _show_explore_loading(self):
+        self.loading_label.set_label("Loading Explore…")
+        self.spinner.start()
+        self.stack.set_visible_child_name("loading")
 
     def _retry_explore_fetch(self):
         if not self._explore_loaded:
@@ -330,23 +342,33 @@ class SearchPage(Adw.Bin):
 
     def load_explore_data(self, force=False):
         if self._explore_loading:
-            return
+            if force:
+                # A network-state change or explicit refresh must not be
+                # silently discarded while the first request is in flight.
+                self._explore_force_pending = True
+            return False
         if self._explore_loaded and not force:
-            return
+            return False
         if force:
             self._explore_loaded = False
         self._explore_loading = True
-        thread = threading.Thread(target=self._fetch_explore)
-        thread.daemon = True
+        self._explore_generation += 1
+        generation = self._explore_generation
+        if not self._search_active:
+            self._show_explore_loading()
+        thread = threading.Thread(
+            target=self._fetch_explore, args=(generation,), daemon=True
+        )
         thread.start()
+        return False
 
     def refresh_explore(self):
         self.load_explore_data(force=True)
 
-    def _fetch_explore(self):
+    def _fetch_explore(self, generation):
         from ui.utils import is_online
         if not is_online():
-            GObject.idle_add(self.update_explore_ui, None)
+            GObject.idle_add(self.update_explore_ui, None, generation)
             return
 
         country = getattr(self, "_charts_country", "ZZ")
@@ -373,7 +395,7 @@ class SearchPage(Adw.Bin):
             explore = self.client.get_explore()
         except Exception as e:
             print(f"Error fetching explore data: {e}")
-            GObject.idle_add(self.update_explore_ui, None)
+            GObject.idle_add(self.update_explore_ui, None, generation)
             return
 
         cat_t.join()
@@ -382,11 +404,21 @@ class SearchPage(Adw.Bin):
             explore["separated_categories"] = results["categories"]
         if results["charts"]:
             explore["_charts"] = results["charts"]
-        GObject.idle_add(self.update_explore_ui, explore)
+        GObject.idle_add(self.update_explore_ui, explore, generation)
 
-    def update_explore_ui(self, data):
+    def update_explore_ui(self, data, generation=None):
+        if generation is not None and generation != self._explore_generation:
+            return False
         self._explore_loading = False
+        if not self._search_active:
+            self.spinner.stop()
+        if self._explore_force_pending:
+            self._explore_force_pending = False
+            GLib.idle_add(self.load_explore_data, True)
+            return False
         if not data:
+            if not self._search_active:
+                self.stack.set_visible_child_name("explore")
             from ui.utils import is_online
             if not is_online():
                 child = self.explore_box.get_first_child()
@@ -455,6 +487,8 @@ class SearchPage(Adw.Bin):
         charts = data.get("_charts")
         if charts:
             self._add_charts_sections(charts)
+        if not self._search_active:
+            self.stack.set_visible_child_name("explore")
 
     def add_horizontal_section(self, parent_box, title, items, is_category=False):
         if not items:
@@ -697,39 +731,26 @@ class SearchPage(Adw.Bin):
         if 0 <= idx < len(options):
             self._charts_country = options[idx]
             self._save_charts_country(options[idx])
-            self.load_explore_data()
+            # A country change must replace the already-rendered chart
+            # sections; a non-forced load is intentionally a no-op once
+            # Explore has completed.
+            self.load_explore_data(force=True)
 
     @staticmethod
     def _get_prefs_path():
-        import os
-        return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+        return user_prefs_path()
 
     def _save_charts_country(self, code):
-        import json, os
-        path = self._get_prefs_path()
-        prefs = {}
         try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    prefs = json.load(f)
+            update_prefs(self._get_prefs_path(), {"charts_country": code})
         except Exception:
             pass
-        prefs["charts_country"] = code
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(prefs, f)
 
     def _load_charts_country(self):
-        import json, os
-        path = self._get_prefs_path()
         try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    prefs = json.load(f)
-                return prefs.get("charts_country", "ZZ")
+            return read_prefs(self._get_prefs_path(), {}).get("charts_country", "ZZ")
         except Exception:
-            pass
-        return "ZZ"
+            return "ZZ"
 
     def _on_chart_playlist_clicked(self, *args, **kwargs):
         item = args[-1] if args else kwargs.get("item")
@@ -972,6 +993,7 @@ class SearchPage(Adw.Bin):
             self.search_timer = None
 
         text = (text or "").strip()
+        self._search_active = len(text) > 2
 
         if len(text) == 0:
             self.stack.set_visible_child_name("explore")
@@ -984,6 +1006,8 @@ class SearchPage(Adw.Bin):
 
     def perform_search(self, query):
         self.search_timer = None
+        self.loading_label.set_label("Searching…")
+        self.spinner.start()
         self.stack.set_visible_child_name("loading")
         thread = threading.Thread(target=self._search_thread, args=(query,))
         thread.daemon = True
@@ -1071,6 +1095,7 @@ class SearchPage(Adw.Bin):
             self.results_stack.set_visible_child_name(selected_name)
 
     def update_results(self, results):
+        self.spinner.stop()
         self.stack.set_visible_child_name("results")
 
         while child := self.results_stack.get_first_child():

@@ -443,6 +443,10 @@ class ExpandedPlayer(Gtk.Box):
     def _on_map(self, widget):
         self._sync_height_probe()
         GLib.idle_add(self._center_carousel)
+        self.on_state_changed(self.player, self.player.get_state_string())
+        if hasattr(self.player, "get_position_snapshot"):
+            pos, dur = self.player.get_position_snapshot()
+            self.on_progression(self.player, pos, dur)
         if self.player.current_video_id and 0 <= self.player.current_queue_index < len(
             self.player.queue
         ):
@@ -658,6 +662,8 @@ class ExpandedPlayer(Gtk.Box):
         return False
 
     def on_progression(self, player, pos, dur):
+        if not self.get_mapped():
+            return
         self.scale.set_range(0, dur)
         self.scale.set_value(pos)
         self.pos_label.set_label(self._format_time(pos))
@@ -689,6 +695,13 @@ class ExpandedPlayer(Gtk.Box):
             self.player.play()
 
     def on_state_changed(self, player, state):
+        # Queue/repeat notifications do not describe the transport state.
+        # Do not turn the FFT off merely because the queue was edited while
+        # the current track is still playing.
+        if hasattr(self, "visualizer") and state in (
+            "playing", "paused", "loading", "stopped"
+        ):
+            self.visualizer.set_active(state == "playing")
         if state == "queue-updated":
             self._sync_carousel_queue()
             return

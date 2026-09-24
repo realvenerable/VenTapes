@@ -264,6 +264,7 @@ class QueuePanel(Gtk.Box):
         self.connect("map", self._on_map)  # Refresh when visible
 
         # Initial Populate
+        self._queue_dirty = False
         self._populate()
         self._update_shuffle_state()
         self._update_repeat_state()
@@ -314,8 +315,10 @@ class QueuePanel(Gtk.Box):
         threading.Thread(target=thread_func, daemon=True).start()
 
     def _on_map(self, *args):
-        # Refresh list when sidebar becomes visible - but only if count changed
-        if self.store.get_n_items() != len(self.player.queue):
+        # A hidden panel may have missed a same-length shuffle/reorder.  Keep
+        # a dirty bit so remapping replays structural updates, not just length
+        # changes.
+        if self._queue_dirty or self.store.get_n_items() != len(self.player.queue):
             self._populate()
         else:
             self._update_item_states()
@@ -376,6 +379,7 @@ class QueuePanel(Gtk.Box):
             items.append(QueueItem(track, i, i == current_idx, is_paused))
 
         self.store.splice(0, self.store.get_n_items(), items)
+        self._queue_dirty = False
         self.count_label.set_label(f"{len(queue)} tracks")
 
         if self.get_mapped():
@@ -448,23 +452,30 @@ class QueuePanel(Gtk.Box):
             pass
 
     def _on_player_update(self, player, *args):
-        self._update_shuffle_state()
-        self._update_repeat_state()
-
         # Determine if this is a state-changed or metadata-changed signal
         # state-changed (player, state) -> args = (state,)
         # metadata-changed (player, title, artist, thumb, ...) -> args = (title, ...)
-
         state = args[0] if len(args) == 1 else None
+        structural = (
+            state == "queue-updated"
+            or self.store.get_n_items() != len(self.player.queue)
+        )
+
+        # Queue sidebars are duplicated (desktop + expanded player).  The
+        # hidden copy records structural changes and replays them on map.
+        if not self.get_mapped():
+            if structural:
+                self._queue_dirty = True
+            return
+        self._update_shuffle_state()
+        self._update_repeat_state()
 
         # If queue length changed OR structural update requested, we MUST repopulate.
         # Defer to idle: this signal can fire synchronously from inside a row's
         # click gesture handler (via play_queue_index → stop → state-changed),
         # and splicing the ListStore mid-gesture frees the GtkListItem the
         # gesture is still unwinding from, causing a segfault.
-        if state == "queue-updated" or self.store.get_n_items() != len(
-            self.player.queue
-        ):
+        if structural:
             GLib.idle_add(self._populate)
         else:
             # Otherwise, just update indicators (very efficient!)

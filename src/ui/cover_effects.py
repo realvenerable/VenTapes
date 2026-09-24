@@ -7,6 +7,7 @@ import io
 import math
 import os
 import re
+import tempfile
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -287,6 +288,7 @@ def get_blurred_cover(
     output_size=720,
     dark=True,
     callback=None,
+    cancel_event=None,
 ):
     """Blur `url` on a worker thread, normalized into `dark`'s
     luminance band. See _normalize_blur.
@@ -319,22 +321,36 @@ def get_blurred_cover(
         f"{_thumb_cache_key(url)}_b{blur_radius}_s{output_size}_{scheme_tag}.png",
     )
 
+    def _cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     def _worker():
+        tmp_path = None
+        if _cancelled():
+            return
         data = _ensure_image_bytes(url)
+        if _cancelled():
+            return
         if not data:
             if callback:
                 GLib.idle_add(callback, None, None)
             return
         try:
+            if _cancelled():
+                return
             from PIL import Image, ImageFilter
             img = Image.open(io.BytesIO(data)).convert("RGB")
             # One verdict for both effects. Separate ones let a cover
             # keep its backdrop while its accent fell back to the system
             # accent, mixing two unrelated colors.
+            if _cancelled():
+                return
             if pick_accent(img) is None:
                 _remember_blur_cache(cache_key, _NO_BLUR)
                 if callback:
                     GLib.idle_add(callback, None, None)
+                return
+            if _cancelled():
                 return
             w, h = img.size
             side = min(w, h)
@@ -358,9 +374,19 @@ def get_blurred_cover(
                 _percentile(values, 0.5),
                 _percentile(values, 0.98 if dark else 0.02),
             )
-            tmp_path = out_path + ".tmp"
+            if _cancelled():
+                return
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(out_path)}.",
+                suffix=".tmp",
+                dir=os.path.dirname(out_path) or ".",
+            )
+            os.close(fd)
             img.save(tmp_path, "PNG", optimize=True)
+            if _cancelled():
+                return
             os.replace(tmp_path, out_path)
+            tmp_path = None
             _remember_blur_cache(cache_key, (out_path, backdrop))
             if callback:
                 GLib.idle_add(callback, out_path, backdrop)
@@ -368,6 +394,12 @@ def get_blurred_cover(
             print(f"[cover_effects] blur failed for {url}: {e}")
             if callback:
                 GLib.idle_add(callback, None, None)
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     _submit_effect_worker(_worker)
 
@@ -447,7 +479,7 @@ def pick_accent(img):
     return color_utils.oklch_to_rgb(min(0.85, max(0.35, median)), 0.0, 0.0)
 
 
-def get_dominant_color(url, callback=None):
+def get_dominant_color(url, callback=None, cancel_event=None):
     """Extract an accent color from `url` on a worker thread.
 
     Calls `callback((r, g, b))` with floats 0..1, or `callback(None)`
@@ -471,16 +503,27 @@ def get_dominant_color(url, callback=None):
             GLib.idle_add(callback, None if cached is _NO_ACCENT else cached)
         return
 
+    def _cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
     def _worker():
+        if _cancelled():
+            return
         data = _ensure_image_bytes(url)
+        if _cancelled():
+            return
         if not data:
             if callback:
                 GLib.idle_add(callback, None)
             return
         try:
+            if _cancelled():
+                return
             from PIL import Image
             img = Image.open(io.BytesIO(data)).convert("RGB")
             best = pick_accent(img)
+            if _cancelled():
+                return
             _remember_color_cache(url, best if best is not None else _NO_ACCENT)
             if callback:
                 GLib.idle_add(callback, best)

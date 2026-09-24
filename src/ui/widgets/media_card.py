@@ -1,3 +1,5 @@
+import weakref
+
 from gi.repository import Gtk, Adw, Pango
 from ui.utils import AsyncImage, parse_item_metadata, bind_weak_signal
 
@@ -357,14 +359,19 @@ class MediaCardWidget(Gtk.Button):
         return item.get("subtitle") or item.get("description") or ""
 
     def _attach_playing_state(self, video_id):
+        weak_self = weakref.ref(self)
+
         def update_state(*_):
-            current_id = getattr(self.player, "current_video_id", None)
+            target = weak_self()
+            if target is None:
+                return False
+            current_id = getattr(target.player, "current_video_id", None)
             if current_id and current_id == video_id:
-                self.add_css_class("playing")
-                self.remove_css_class("flat")
+                target.add_css_class("playing")
+                target.remove_css_class("flat")
             else:
-                self.remove_css_class("playing")
-                self.add_css_class("flat")
+                target.remove_css_class("playing")
+                target.add_css_class("flat")
 
         update_state()
         bind_weak_signal(self.player, "metadata-changed", self, update_state)

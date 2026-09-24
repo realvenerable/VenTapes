@@ -309,7 +309,8 @@ class LyricRow(Gtk.ListBoxRow):
 
     def __init__(self, line, line_idx, second_line_mode="auto", 
                  effects=lyrics_prefs.EFFECTS_DEFAULT, sweep_end_ms=None,
-                 sweep=True, active_scale=lyrics_prefs.ACTIVE_SCALE_DEFAULT):
+                 sweep=True, active_scale=lyrics_prefs.ACTIVE_SCALE_DEFAULT,
+                 is_paused=False):
         super().__init__()
         self.line_idx = line_idx
         self.is_static = line.get("start") is None
@@ -399,7 +400,7 @@ class LyricRow(Gtk.ListBoxRow):
         self._cursor_ms = -1
         self._internal_cursor_ms = -1
         self._wants_turn_off = False
-        self.is_paused = False
+        self.is_paused = bool(is_paused)
         
         self._scale = 1.0
         self._scale_target = 1.0
@@ -417,13 +418,67 @@ class LyricRow(Gtk.ListBoxRow):
 
         self._recompute_targets()
         self._dirty = True
-        self.add_tick_callback(self._on_tick)
+        self._tick_id = None
+        self._color_cache = None
+        self._color_cache_at = 0.0
+        self.connect("map", self._on_map)
+        self.connect("unmap", self._on_unmap)
+        self.connect("destroy", self._on_destroy)
+
+    def _start_tick(self):
+        if (
+            self._tick_id is None
+            and self.get_mapped()
+            and not self.is_paused
+        ):
+            self._tick_id = self.add_tick_callback(self._on_tick)
+
+    def _stop_tick(self, *_):
+        if self._tick_id is not None:
+            try:
+                self.remove_tick_callback(self._tick_id)
+            except Exception:
+                pass
+            self._tick_id = None
+
+    def set_paused(self, paused):
+        paused = bool(paused)
+        if paused == self.is_paused:
+            return
+        self.is_paused = paused
+        if paused:
+            self._stop_tick()
+        else:
+            self._last_tick_time = GLib.get_monotonic_time() / 1000.0
+            self._start_tick()
+
+    def _on_map(self, *_):
+        if not self.is_paused and (self._cursor_ms >= 0 or self._wants_turn_off):
+            self._start_tick()
+
+    def _on_unmap(self, *_):
+        self._stop_tick()
+
+    def _on_destroy(self, *_):
+        self._stop_tick()
+
+    def _settle_now(self):
+        """Render a static/inactive row without installing a frame callback."""
+
+        self._word_alphas = list(self._word_targets)
+        self._sub_alphas = list(self._sub_targets)
+        self._scale = self._scale_target
+        self._blur = self._blur_target
+        self._dirty = False
+        self._render_markup()
+        self._render_sub_markup()
+        self.queue_draw()
 
     def reset_state(self):
+        self._stop_tick()
         self._cursor_ms = -1
         self._internal_cursor_ms = -1
         self._wants_turn_off = False
-        self.is_paused = False
         self._scale = 1.0
         self._scale_target = 1.0
         self._blur = 0.0
@@ -442,6 +497,8 @@ class LyricRow(Gtk.ListBoxRow):
             self.sub_label.set_opacity(1.0)
 
         self._last_tick_time = GLib.get_monotonic_time() / 1000.0
+        self._color_cache = None
+        self._color_cache_at = 0.0
         self._dirty = False
         self._render_markup()
         self._render_sub_markup()
@@ -467,9 +524,17 @@ class LyricRow(Gtk.ListBoxRow):
                 p["byte_end"] = -1
 
     def set_cursor_ms(self, ms):
-        if ms == self._cursor_ms and ms != -1: 
+        if ms == self._cursor_ms and ms != -1:
             return
-        
+
+        if self.is_static:
+            self._cursor_ms = ms
+            self._wants_turn_off = False
+            self._recompute_effect_targets()
+            self._recompute_targets()
+            self._settle_now()
+            return
+
         if ms == -1:
             self._wants_turn_off = True
         else:
@@ -477,9 +542,16 @@ class LyricRow(Gtk.ListBoxRow):
             if self._cursor_ms < 0 or abs(self._cursor_ms - ms) > 1000:
                 self._internal_cursor_ms = ms
             self._cursor_ms = ms
-            
+
         self._recompute_effect_targets()
         self._recompute_targets()
+        if self.is_paused:
+            # A seek can happen while paused.  Render its new position once,
+            # but do not install a display-frame callback until playback
+            # resumes.
+            self._settle_now()
+        elif ms >= 0 or self._wants_turn_off:
+            self._start_tick()
 
     def set_distance(self, distance):
         if distance == self._distance: 
@@ -709,6 +781,9 @@ class LyricRow(Gtk.ListBoxRow):
             self._render_sub_markup()
 
     def _on_tick(self, _widget, _frame_clock):
+        if not self.get_mapped() or self.is_paused:
+            self._tick_id = None
+            return GLib.SOURCE_REMOVE
         current_time = GLib.get_monotonic_time() / 1000.0
         delta = current_time - getattr(self, "_last_tick_time", current_time)
         self._last_tick_time = current_time
@@ -764,12 +839,47 @@ class LyricRow(Gtk.ListBoxRow):
                 setattr(self, attr, cur + (target - cur) * (_EFFECT_LERP * 0.6))
                 changed = True
 
-        if changed or self._cursor_ms >= 0:
+        if changed or (self._cursor_ms >= 0 and self._effects != "off"):
             self.queue_draw()
 
+        still_animating = (
+            (self._cursor_ms >= 0 and self._effects != "off")
+            or self._wants_turn_off
+            or any(
+                abs(value - target) > 0.002
+                for value, target in zip(self._word_alphas, self._word_targets)
+            )
+            or (
+                self.sub_label is not None
+                and any(
+                    abs(value - target) > 0.002
+                    for value, target in zip(self._sub_alphas, self._sub_targets)
+                )
+            )
+            or abs(self._scale - self._scale_target) > 0.002
+            or abs(self._blur - self._blur_target) > 0.002
+        )
+        if not still_animating:
+            self._tick_id = None
+            return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
+    def refresh_theme_colors(self):
+        """Re-resolve explicit lyric spans after a theme/accent change."""
+        self._color_cache = None
+        self._color_cache_at = 0.0
+        self._render_markup()
+        self._render_sub_markup()
+        self.queue_draw()
+
     def _get_css_colors(self, label):
+        # Style-context lookups are surprisingly expensive.  The three
+        # values only change when the theme/active state changes, so cache
+        # them briefly instead of asking GTK for every animation frame.
+        now = GLib.get_monotonic_time() / 1000.0
+        if self._color_cache is not None and now - self._color_cache_at < 500:
+            return self._color_cache
+
         ctx = label.get_style_context()
         c_in = ctx.get_color()
 
@@ -787,7 +897,9 @@ class LyricRow(Gtk.ListBoxRow):
         finally:
             ctx.restore()
 
-        return c_in, c_act, c_glow
+        self._color_cache = (c_in, c_act, c_glow)
+        self._color_cache_at = now
+        return self._color_cache
 
     def _lerp_color(self, c1, c2, t):
         c = Gdk.RGBA()
@@ -1167,7 +1279,8 @@ class InterludeRow(Gtk.ListBoxRow):
 
     __gtype_name__ = "VenTapesLyricInterludeRow"
 
-    def __init__(self, start_s, end_s, effects=lyrics_prefs.EFFECTS_DEFAULT):
+    def __init__(self, start_s, end_s, effects=lyrics_prefs.EFFECTS_DEFAULT,
+                 is_paused=False):
         super().__init__()
         self.line_idx = -1
         self.start_ms = int(start_s * 1000)
@@ -1198,10 +1311,54 @@ class InterludeRow(Gtk.ListBoxRow):
         self._targets = [_ALPHA_FUTURE_WORD] * _INTERLUDE_DOTS
         self._swell = [0.0] * _INTERLUDE_DOTS
         self._cursor_ms = -1
+        self.is_paused = bool(is_paused)
         self._t0 = time.monotonic()
-        self.add_tick_callback(self._on_tick)
+        self._tick_id = None
+        self.connect("map", self._on_map)
+        self.connect("unmap", self._on_unmap)
+        self.connect("destroy", self._on_destroy)
+
+    def _start_tick(self):
+        if (
+            self._tick_id is None
+            and self.get_mapped()
+            and not self.is_paused
+        ):
+            self._tick_id = self.add_tick_callback(self._on_tick)
+
+    def _stop_tick(self, *_):
+        if self._tick_id is not None:
+            try:
+                self.remove_tick_callback(self._tick_id)
+            except Exception:
+                pass
+            self._tick_id = None
+
+    def set_paused(self, paused):
+        paused = bool(paused)
+        if paused == self.is_paused:
+            return
+        self.is_paused = paused
+        if paused:
+            self._stop_tick()
+        else:
+            # Preserve the visual swell while paused, but restart the wave
+            # from the current instant so resuming does not jump its phase.
+            self._t0 = time.monotonic()
+            self._start_tick()
+
+    def _on_map(self, *_):
+        if not self.is_paused and self._cursor_ms >= 0:
+            self._start_tick()
+
+    def _on_unmap(self, *_):
+        self._stop_tick()
+
+    def _on_destroy(self, *_):
+        self._stop_tick()
 
     def reset_state(self):
+        self._stop_tick()
         self._cursor_ms = -1
         self._alphas = [_ALPHA_FUTURE_WORD] * _INTERLUDE_DOTS
         self._targets = [_ALPHA_FUTURE_WORD] * _INTERLUDE_DOTS
@@ -1214,6 +1371,14 @@ class InterludeRow(Gtk.ListBoxRow):
             return
         self._cursor_ms = ms
         self._recompute_targets()
+        if self.is_paused:
+            self._alphas = list(self._targets)
+            self._swell = [0.0] * _INTERLUDE_DOTS
+            self.queue_draw()
+        elif ms >= 0:
+            self._start_tick()
+        else:
+            self._stop_tick()
 
     # Distance blur doesn't apply to the marker; it stays legible.
     def set_distance(self, distance):
@@ -1240,6 +1405,9 @@ class InterludeRow(Gtk.ListBoxRow):
             )
 
     def _on_tick(self, _widget, _frame_clock):
+        if not self.get_mapped() or self.is_paused:
+            self._tick_id = None
+            return GLib.SOURCE_REMOVE
         changed = False
         for i, target in enumerate(self._targets):
             cur = self._alphas[i]
@@ -1268,6 +1436,15 @@ class InterludeRow(Gtk.ListBoxRow):
 
         if changed:
             self.queue_draw()
+        still_animating = (
+            (self._cursor_ms >= 0 and self._effects != "off")
+            or any(abs(value - target) > 0.002
+                   for value, target in zip(self._alphas, self._targets))
+            or any(abs(value) > 0.002 for value in self._swell)
+        )
+        if not still_animating:
+            self._tick_id = None
+            return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
     def do_snapshot(self, snapshot):
@@ -1321,9 +1498,13 @@ class LyricsView(Gtk.Box):
 
         # Display prefs (second-line content, effect level). Cached on the
         # view because every row build reads them; refreshed whenever the
-        # settings dialog reports a change.
+        # settings dialog reports a change.  Low-power mode is an effective
+        # runtime override; it never rewrites the user's saved preference.
         self._second_line_mode = lyrics_prefs.ensure_second_line_mode()
-        self._effects = lyrics_prefs.effects_level()
+        self._is_playing = (
+            getattr(player, "get_state_string", lambda: "stopped")() == "playing"
+        )
+        self._effects = self._effective_effects_level()
         self._sweep = lyrics_prefs.line_sweep()
         self._active_scale = lyrics_prefs.active_scale()
         apply_font_scale()
@@ -1361,7 +1542,7 @@ class LyricsView(Gtk.Box):
 
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self.stack.set_transition_duration(150)
+        self.stack.set_transition_duration(0 if self._motion_disabled() else 150)
         self.stack.set_hexpand(True)
         self.stack.set_vexpand(True)
         self._stack_overlay = Gtk.Overlay()
@@ -1579,7 +1760,7 @@ class LyricsView(Gtk.Box):
         self._picker_stack.set_transition_type(
             Gtk.StackTransitionType.SLIDE_LEFT_RIGHT
         )
-        self._picker_stack.set_transition_duration(150)
+        self._picker_stack.set_transition_duration(0 if self._motion_disabled() else 150)
         self._picker_stack.add_named(outer, "sources")
         self._picker_stack.add_named(self._build_matches_page(), "matches")
         self._picker_stack.add_named(self._build_search_page(), "search")
@@ -2155,6 +2336,40 @@ class LyricsView(Gtk.Box):
 
     # ── Public API ─────────────────────────────────────────────────────────
 
+    def _effective_effects_level(self):
+        """Return the saved level adjusted for the current power profile."""
+
+        try:
+            if self.player.get_low_power_mode():
+                return "off"
+            if hasattr(self.player, "get_reduce_motion") and self.player.get_reduce_motion():
+                return "off"
+        except Exception:
+            pass
+        return lyrics_prefs.effects_level()
+
+    def _motion_disabled(self):
+        try:
+            if hasattr(self.player, "get_reduce_motion"):
+                return bool(self.player.get_reduce_motion())
+            return bool(self.player.get_low_power_mode())
+        except Exception:
+            return False
+
+    def refresh_theme_colors(self):
+        """Invalidate cached lyric colors after a theme/accent change."""
+        for row in self._row_for_line.values():
+            try:
+                row.refresh_theme_colors()
+            except Exception:
+                pass
+        for row in self._interlude_rows:
+            try:
+                row.queue_draw()
+            except Exception:
+                pass
+        self.queue_draw()
+
     def refresh(self):
         """Drop this track's cached lyrics and fetch again from scratch."""
         if self._current_video_id:
@@ -2170,9 +2385,14 @@ class LyricsView(Gtk.Box):
         lyrics_prefs.invalidate()
         apply_font_scale()
         second_line = lyrics_prefs.second_line_mode()
-        effects = lyrics_prefs.effects_level()
+        effects = self._effective_effects_level()
         sweep = lyrics_prefs.line_sweep()
         active_scale = lyrics_prefs.active_scale()
+        # Keep the stack/popover transitions in sync with the effective mode
+        # when the power setting changes while the view is alive.
+        transition = 0 if self._motion_disabled() else 150
+        self.stack.set_transition_duration(transition)
+        self._picker_stack.set_transition_duration(transition)
         if (second_line == self._second_line_mode
                 and effects == self._effects
                 and sweep == self._sweep
@@ -2200,6 +2420,17 @@ class LyricsView(Gtk.Box):
             return
         self._log(1, f"metadata-changed: video_id={video_id!r} title={title!r}")
         self._current_video_id = video_id or None
+        if not self.get_mapped():
+            # The desktop and compact players each own a LyricsView.  Do not
+            # fetch/build the same lyrics in the hidden copy; it will resume
+            # from the shared cache when the view is actually shown.
+            self._fetch_gen += 1
+            self._lines = []
+            self._synced = False
+            self._active_idx = -1
+            self._lit_idx = -1
+            self._clear_rows()
+            return
         self._refresh_for_current_track()
 
     def _on_progression(self, player, pos, dur):
@@ -2210,10 +2441,10 @@ class LyricsView(Gtk.Box):
         # desktop cover view). Only the mapped one should drive scrolls
         # so they don't race each other and double up signal handlers.
         if not self.get_mapped():
-            # Still record the active idx so the next progression after
-            # we become visible doesn't re-trigger a stale activation.
-            new_idx = self._index_for_position(pos)
-            self._active_idx = new_idx
+            # The visible copy will recalculate this on map.  Avoid an
+            # O(number-of-lines) lookup in the hidden duplicate on every
+            # progress tick.
+            self._active_idx = -1
             return
 
         pending_start = getattr(self, "_seek_pending_start", None)
@@ -2282,6 +2513,8 @@ class LyricsView(Gtk.Box):
         # Switching into this view: jump straight to the correct line
         # without animation so the user lands on the right spot.
         self._log(1, "view mapped")
+        if self._current_video_id and not self._lines:
+            self._refresh_for_current_track()
         if self._synced and self._lines:
             pos = self._last_pos
             ms = int(pos * 1000)
@@ -2298,16 +2531,26 @@ class LyricsView(Gtk.Box):
                 self._activate_row(self._index_for_position(pos), cursor_ms=ms)
 
     def _on_state_changed(self, player, state):
-        is_paused = (state == "paused")
+        # Queue/repeat notifications are unrelated to transport.  Treat only
+        # actual playback states as a pause/resume edge; otherwise adding a
+        # queue item would stop lyric animations until the next track event.
+        if state not in ("playing", "paused", "loading", "stopped"):
+            return
+        # Treat loading/stopped like paused for animation purposes.  Their
+        # progression stream may be absent, but rows can still be rebuilt
+        # while a new URI is prerolling.
+        self._is_playing = (state == "playing")
+        is_paused = not self._is_playing
 
         for row in self._row_for_line.values():
-            row.is_paused = is_paused
+            row.set_paused(is_paused)
             
         for row in self._interlude_rows:
-            if hasattr(row, "is_paused"):
-                row.is_paused = is_paused
+            if hasattr(row, "set_paused"):
+                row.set_paused(is_paused)
 
         if state == "stopped" and not self.player.current_video_id:
+            self._fetch_gen += 1
             self._current_video_id = None
             self._lines = []
             self._render_status("empty", title="Not playing")
@@ -2463,7 +2706,11 @@ class LyricsView(Gtk.Box):
             # Emit any interlude that finishes before this line starts.
             while pending and start is not None and pending[0][1] <= start:
                 gap_start, gap_end = pending.pop(0)
-                row = InterludeRow(gap_start, gap_end, effects=self._effects)
+                row = InterludeRow(
+                    gap_start, gap_end,
+                    effects=self._effects,
+                    is_paused=not self._is_playing,
+                )
                 self.lrc_list.append(row)
                 self._interlude_rows.append(row)
 
@@ -2479,6 +2726,7 @@ class LyricsView(Gtk.Box):
                 sweep_end_ms=self._sweep_end_ms(i),
                 sweep=self._sweep,
                 active_scale=self._active_scale,
+                is_paused=not self._is_playing,
             )
             # Plain (unsynced) sources have no cursor to scrub against, so
             # the active-line dim/bright contrast just communicates "this
@@ -2491,7 +2739,11 @@ class LyricsView(Gtk.Box):
             self._row_for_line[i] = row
 
         for gap_start, gap_end in pending:
-            row = InterludeRow(gap_start, gap_end, effects=self._effects)
+            row = InterludeRow(
+                gap_start, gap_end,
+                effects=self._effects,
+                is_paused=not self._is_playing,
+            )
             self.lrc_list.append(row)
             self._interlude_rows.append(row)
 
@@ -2680,6 +2932,13 @@ class LyricsView(Gtk.Box):
         ``target`` over ``duration_ms`` with an ease-out curve. Any
         in-flight animation is cancelled first so consecutive calls
         seamlessly retarget."""
+        if self._motion_disabled():
+            if self._scroll_anim_source:
+                self.remove_tick_callback(self._scroll_anim_source)
+                self._scroll_anim_source = 0
+            adj.set_value(target)
+            return
+
         if self._scroll_anim_source:
             self.remove_tick_callback(self._scroll_anim_source)
             self._scroll_anim_source = 0

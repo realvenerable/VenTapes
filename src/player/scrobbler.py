@@ -14,6 +14,7 @@ import tempfile
 from urllib.parse import urlencode
 
 from version import APP_VERSION
+from ui.preferences import get_bool, read_prefs, user_prefs_path
 
 
 # Last.fm requires client credentials. VenTapes deliberately does not reuse
@@ -103,15 +104,15 @@ def _write_json(path, data, private=False):
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
-            fd, temporary_path = tempfile.mkstemp(
-                prefix=".scrobbler-", suffix=".tmp", dir=directory
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2)
-        else:
-            temporary_path = path + ".tmp"
-            with open(temporary_path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2)
+        # Always use a unique sibling temporary file.  The old fixed
+        # ``path + ".tmp"`` name let the UI thread and the scrobbler worker
+        # replace/remove the same file concurrently, which could lose a
+        # backlog update or leave a half-written queue behind.
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}-", suffix=".tmp", dir=directory
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
         if private and os.name == "posix":
             os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, path)
@@ -126,15 +127,15 @@ def _write_json(path, data, private=False):
 
 
 def _get_prefs():
-    return _read_json(os.path.join(_data_dir(), "prefs.json"), {})
+    return read_prefs(user_prefs_path(), {})
 
 
 def get_scrobble_enabled():
-    return _get_prefs().get("scrobble_enabled", True)
+    return get_bool(_get_prefs(), "scrobble_enabled", True)
 
 
 def get_now_playing_enabled():
-    return _get_prefs().get("scrobble_now_playing", True)
+    return get_bool(_get_prefs(), "scrobble_now_playing", True)
 
 
 def _load_creds():
@@ -179,9 +180,15 @@ class ScrobblerAdapter:
         self.player = player
         self.last_error = ""
         self._lock = threading.RLock()
+        # Lifecycle state is separate from the pending/credential lock.  It
+        # serializes the check-and-start of the worker with preference
+        # toggles, authentication callbacks, and shutdown.
+        self._lifecycle_lock = threading.RLock()
         self._queue = queue.Queue()
         self._local = threading.local()
         self._stopping = False
+        self._explicit_stop = False
+        self._restart_requested = False
         self._creds = _load_creds()
         self._pending = _load_pending()
         self._enabled = get_scrobble_enabled()
@@ -189,12 +196,48 @@ class ScrobblerAdapter:
         self._cur = None
         self._last_flush = time.monotonic()
 
-        self._worker = threading.Thread(
-            target=self._run, daemon=True, name="scrobbler"
-        )
-        self._worker.start()
+        self._worker = None
+        # Most installations never connect a scrobbling service.  Start the
+        # worker lazily so an unused feature does not keep a thread (and its
+        # HTTP/session machinery) alive for the whole session.
+        if self._enabled and (self.pending_count() or any(self._creds.values())):
+            self._ensure_worker()
         if self.pending_count():
             self._queue.put(("flush", None))
+
+    def _start_worker_locked(self):
+        """Start the sole worker while ``_lifecycle_lock`` is held."""
+
+        if not self._enabled or self._explicit_stop:
+            return
+        self._stopping = False
+        self._restart_requested = False
+        worker = threading.Thread(
+            target=self._run, daemon=True, name="scrobbler"
+        )
+        self._worker = worker
+        try:
+            worker.start()
+        except Exception:
+            self._worker = None
+            raise
+
+    def _ensure_worker(self):
+        # Authentication callbacks and preference changes can arrive on
+        # different threads.  Keep the liveness check and thread start under
+        # one lock so two workers can never own the same persisted backlog.
+        with self._lifecycle_lock:
+            if not self._enabled or self._explicit_stop:
+                return
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                if self._stopping:
+                    # A pause/shutdown is unwinding.  The old worker will
+                    # either continue after seeing the re-enable or restart
+                    # itself from its finalizer.
+                    self._restart_requested = True
+                return
+            self._start_worker_locked()
 
     # -- State queried by the preferences UI -----------------------------
 
@@ -216,19 +259,56 @@ class ScrobblerAdapter:
             return sum(len(v or []) for v in self._pending.values())
 
     def get_enabled(self):
-        return self._enabled
+        with self._lifecycle_lock:
+            return self._enabled
 
     def set_enabled(self, enabled):
-        self._enabled = bool(enabled)
-        if self._enabled:
-            self._queue.put(("flush", None))
+        enabled = bool(enabled)
+        worker = None
+        with self._lifecycle_lock:
+            if self._explicit_stop:
+                return
+            self._enabled = enabled
+            if not enabled:
+                worker = self._worker
+                if worker is not None and worker.is_alive():
+                    # Do not let an already queued operation flush while the
+                    # user has disabled scrobbling.  The worker drains any
+                    # scrobble payloads into the persistent backlog before it
+                    # exits and closes its HTTP session.
+                    self._stopping = True
+                    self._restart_requested = False
+                    self._queue.put(("pause", None))
+                if worker is None or not worker.is_alive():
+                    self._drain_disabled_queue()
+                return
+
+            self._restart_requested = True
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                # A pause may be in flight.  Let that worker see the new
+                # enabled state and continue, or restart from its finalizer.
+                self._stopping = False
+            if self.pending_count() or any(self._creds.values()):
+                self._queue.put(("flush", None))
+            self._ensure_worker()
 
     def set_now_playing_enabled(self, enabled):
-        self._now_playing_enabled = bool(enabled)
+        with self._lifecycle_lock:
+            self._now_playing_enabled = bool(enabled)
 
     def stop(self):
-        self._stopping = True
-        self._queue.put(("stop", None))
+        with self._lifecycle_lock:
+            self._explicit_stop = True
+            self._restart_requested = False
+            self._stopping = True
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                self._queue.put(("stop", None))
+        if worker is None or not worker.is_alive():
+            # There may be a queue left from a disabled period.  Persist its
+            # scrobble payloads before the adapter is discarded.
+            self._drain_disabled_queue()
 
     # -- Player events ---------------------------------------------------
 
@@ -342,8 +422,9 @@ class ScrobblerAdapter:
         }
 
     def _playable(self, cur):
-        if not self._enabled or self._stopping:
-            return False
+        with self._lifecycle_lock:
+            if not self._enabled or self._stopping or self._explicit_stop:
+                return False
         if not cur["track"] or not cur["artist"]:
             return False
         # A missing duration is unknown, not short, so only reject a known
@@ -365,27 +446,98 @@ class ScrobblerAdapter:
 
     # -- Worker ----------------------------------------------------------
 
-    def _run(self):
-        while not self._stopping:
+    def _drain_disabled_queue(self):
+        """Persist queued scrobbles while no network worker is allowed to run.
+
+        A scrobble can have been queued just before the preference switch.
+        Dropping that in-memory payload would lose a listen even though the
+        persisted backlog is intact, so consume the queue locally and append
+        only scrobble entries.  Flush/now-playing commands are intentionally
+        discarded while disabled.
+        """
+
+        saw_scrobble = False
+        while True:
             try:
-                op, payload = self._queue.get(timeout=30.0)
+                op, payload = self._queue.get_nowait()
             except queue.Empty:
-                idle = time.monotonic() - self._last_flush
-                if self.pending_count() and idle > RETRY_INTERVAL:
-                    self._flush()
-                continue
-
-            if op == "stop":
                 break
-            if op == "now_playing":
-                self._do_now_playing(payload)
-            elif op == "scrobble":
+            if op == "scrobble":
                 self._append_pending(payload)
-                self._flush()
-            elif op == "flush":
-                self._flush()
+                saw_scrobble = True
+            elif op == "stop":
+                with self._lifecycle_lock:
+                    self._explicit_stop = True
+                    self._stopping = True
+                break
+            # pause/now_playing/flush have no useful work to do while the
+            # adapter is disabled.  A later enable will enqueue a fresh flush.
+        return saw_scrobble
 
-        self._close_thread_session()
+    def _run(self):
+        try:
+            while True:
+                try:
+                    op, payload = self._queue.get(timeout=30.0)
+                except queue.Empty:
+                    with self._lifecycle_lock:
+                        should_stop = (
+                            self._explicit_stop
+                            or not self._enabled
+                            or self._stopping
+                        )
+                    if should_stop:
+                        self._drain_disabled_queue()
+                        break
+                    idle = time.monotonic() - self._last_flush
+                    if self.pending_count() and idle > RETRY_INTERVAL:
+                        self._flush()
+                    continue
+
+                if op == "stop":
+                    self._drain_disabled_queue()
+                    break
+                if op == "pause":
+                    self._drain_disabled_queue()
+                    with self._lifecycle_lock:
+                        if self._enabled and not self._explicit_stop:
+                            # The user may have toggled scrobbling back on
+                            # while the pause command was in flight.
+                            self._stopping = False
+                        else:
+                            self._stopping = True
+                            break
+                    self._flush()
+                    continue
+
+                with self._lifecycle_lock:
+                    active = (
+                        self._enabled
+                        and not self._stopping
+                        and not self._explicit_stop
+                    )
+                if not active:
+                    if op == "scrobble":
+                        self._append_pending(payload)
+                    continue
+                if op == "now_playing":
+                    self._do_now_playing(payload)
+                elif op == "scrobble":
+                    self._append_pending(payload)
+                    self._flush()
+                elif op == "flush":
+                    self._flush()
+        finally:
+            self._close_thread_session()
+            with self._lifecycle_lock:
+                if self._worker is threading.current_thread():
+                    self._worker = None
+                    if (
+                        self._enabled
+                        and not self._explicit_stop
+                        and self._restart_requested
+                    ):
+                        self._start_worker_locked()
 
     def _do_now_playing(self, entry):
         senders = {
@@ -414,9 +566,16 @@ class ScrobblerAdapter:
                 if len(bucket) > MAX_PENDING:
                     del bucket[:-MAX_PENDING]
             snapshot = json.loads(json.dumps(self._pending))
-        _save_pending(snapshot)
+            # Keep the state snapshot and its replacement ordered with
+            # disconnects and other worker writes.  A unique temp file avoids
+            # corruption; this lock prevents an older snapshot from winning
+            # after a newer state transition.
+            _save_pending(snapshot)
 
     def _flush(self):
+        with self._lifecycle_lock:
+            if not self._enabled or self._stopping or self._explicit_stop:
+                return
         self._last_flush = time.monotonic()
         senders = {
             "lastfm": self._lastfm_scrobble,
@@ -425,7 +584,10 @@ class ScrobblerAdapter:
         for service, send in senders.items():
             if not self.is_connected(service):
                 continue
-            while not self._stopping:
+            while True:
+                with self._lifecycle_lock:
+                    if not self._enabled or self._stopping or self._explicit_stop:
+                        break
                 with self._lock:
                     batch = list((self._pending.get(service) or [])[:BATCH_SIZE])
                 if not batch:
@@ -459,16 +621,16 @@ class ScrobblerAdapter:
             dropped = len(bucket) - len(kept)
             self._pending[service] = kept
             snapshot = json.loads(json.dumps(self._pending))
-        if dropped:
-            print(f"[SCROBBLE] dropped {dropped} unsendable {service} listen(s)")
-        _save_pending(snapshot)
+            if dropped:
+                print(f"[SCROBBLE] dropped {dropped} unsendable {service} listen(s)")
+            _save_pending(snapshot)
 
     def _drop_sent(self, service, count):
         with self._lock:
             bucket = self._pending.get(service) or []
             self._pending[service] = bucket[count:]
             snapshot = json.loads(json.dumps(self._pending))
-        _save_pending(snapshot)
+            _save_pending(snapshot)
 
     def _handle_auth_error(self, service, error):
         print(f"[SCROBBLE] {service} credentials rejected: {error}")
@@ -755,9 +917,11 @@ class ScrobblerAdapter:
         with self._lock:
             self._creds[service] = entry
             snapshot = json.loads(json.dumps(self._creds))
-        _save_creds(snapshot)
+            _save_creds(snapshot)
         self.last_error = ""
-        self._queue.put(("flush", None))
+        if self.get_enabled():
+            self._ensure_worker()
+            self._queue.put(("flush", None))
 
     def disconnect(self, service):
         self.last_error = ""
@@ -766,5 +930,5 @@ class ScrobblerAdapter:
             self._pending[service] = []
             creds = json.loads(json.dumps(self._creds))
             pending = json.loads(json.dumps(self._pending))
-        _save_creds(creds)
-        _save_pending(pending)
+            _save_creds(creds)
+            _save_pending(pending)

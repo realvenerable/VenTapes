@@ -2,9 +2,17 @@ import threading
 import os
 import shutil
 import tempfile
+import weakref
 from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio, GdkPixbuf
 from api.client import MusicClient
-from ui.utils import AsyncImage, LikeButton, get_yt_music_link, show_toast, bind_weak_signal
+from ui.utils import (
+    AsyncImage,
+    LikeButton,
+    bind_weak_signal,
+    disconnect_weak_signal,
+    get_yt_music_link,
+    show_toast,
+)
 from ui.context_menu import MenuAction, show_song_menu
 from ui.crop_dialog import ImageCropDialog
 from ui.util_classes import ScrolledWindow
@@ -794,20 +802,25 @@ class PlaylistPage(Adw.Bin):
         }
         row._lv_full_track = t
 
+        weak_row = weakref.ref(row)
+
         def _sync_playing(p, *args):
+            target = weak_row()
+            if target is None:
+                return False
             curr = getattr(p, "current_video_id", None)
             if curr and curr == video_id:
-                row.add_css_class("playing")
-                row.remove_css_class("flat")
+                target.add_css_class("playing")
+                target.remove_css_class("flat")
             else:
-                row.remove_css_class("playing")
-                row.add_css_class("flat")
+                target.remove_css_class("playing")
+                target.add_css_class("flat")
 
         _sync_playing(self.player)
 
         if getattr(row, "_lv_player_handler", None):
             try:
-                self.player.disconnect(row._lv_player_handler)
+                disconnect_weak_signal(self.player, row._lv_player_handler)
             except Exception:
                 pass
             row._lv_player_handler = None
@@ -830,7 +843,7 @@ class PlaylistPage(Adw.Bin):
         row = getattr(track_ui, "_lv_row", track_ui)
         if row._lv_player_handler is not None:
             try:
-                self.player.disconnect(row._lv_player_handler)
+                disconnect_weak_signal(self.player, row._lv_player_handler)
             except Exception:
                 pass
             row._lv_player_handler = None
@@ -1172,6 +1185,14 @@ class PlaylistPage(Adw.Bin):
                 self.emit("header-title-changed", "")
         self._refresh_more_menu()
         dm = self.player.download_manager
+        for attr in ("_dl_queued_id", "_dl_done_id"):
+            old_id = getattr(self, attr, 0)
+            if old_id:
+                try:
+                    disconnect_weak_signal(dm, old_id)
+                except Exception:
+                    pass
+                setattr(self, attr, 0)
         self._dl_queued_id = bind_weak_signal(
             dm, "item-queued", self, self._on_dl_indicator_update
         )
@@ -1409,10 +1430,10 @@ class PlaylistPage(Adw.Bin):
         # Disconnect download signals
         dm = self.player.download_manager
         if hasattr(self, "_dl_queued_id") and self._dl_queued_id:
-            dm.disconnect(self._dl_queued_id)
+            disconnect_weak_signal(dm, self._dl_queued_id)
             self._dl_queued_id = None
         if hasattr(self, "_dl_done_id") and self._dl_done_id:
-            dm.disconnect(self._dl_done_id)
+            disconnect_weak_signal(dm, self._dl_done_id)
             self._dl_done_id = None
 
     # ── Load playlist ─────────────────────────────────────────────────────────

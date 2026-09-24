@@ -2,6 +2,7 @@ from gi.repository import Gtk, Adw, GObject, GLib, Pango, Gdk, Gio
 import threading
 import json
 import re
+import weakref
 from api.client import MusicClient
 from ui.utils import (
     AsyncImage, AsyncPicture, LikeButton, parse_item_metadata,
@@ -276,17 +277,24 @@ class ArtistPage(Adw.Bin):
         if not video_id:
             return
     
+        weak_widget = weakref.ref(widget)
+        weak_player = weakref.ref(player)
+
         def update_state(*args):
-            current_id = getattr(player, "current_video_id", None)
+            target = weak_widget()
+            source = weak_player()
+            if target is None or source is None:
+                return False
+            current_id = getattr(source, "current_video_id", None)
             is_playing = bool(current_id and current_id == video_id)
             if is_playing:
-                widget.add_css_class("playing")
+                target.add_css_class("playing")
                 if is_button:
-                    widget.remove_css_class("flat")
+                    target.remove_css_class("flat")
             else:
-                widget.remove_css_class("playing")
+                target.remove_css_class("playing")
                 if is_button:
-                    widget.add_css_class("flat")
+                    target.add_css_class("flat")
     
         update_state()
         bind_weak_signal(player, "metadata-changed", widget, update_state)

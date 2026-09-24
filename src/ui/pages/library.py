@@ -1,9 +1,9 @@
 import os
-import json as _json
 from gi.repository import Gtk, Adw, GObject, GLib, Gdk, Gio, Pango
 import threading
 from api.client import MusicClient
 from ui.utils import show_toast
+from ui.preferences import read_prefs, update_prefs, user_prefs_path
 from ui.context_menu import MenuAction, show_item_menu
 from ui.util_classes import ScrolledWindow
 from ui.widgets.media_card import (
@@ -17,26 +17,16 @@ LIBRARY_VIEW_MODES = ("list", "grid")
 DEFAULT_LIBRARY_VIEW_MODE = "grid"
 
 def _prefs_path():
-    return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+    return user_prefs_path()
 
 
 def _load_prefs():
-    path = _prefs_path()
-    try:
-        if os.path.exists(path):
-            with open(path) as f:
-                return _json.load(f)
-    except Exception:
-        pass
-    return {}
+    return read_prefs(_prefs_path(), {})
 
 
-def _save_prefs(prefs):
-    path = _prefs_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _save_pref(key, value):
     try:
-        with open(path, "w") as f:
-            _json.dump(prefs, f)
+        update_prefs(_prefs_path(), {key: value})
     except Exception:
         pass
 
@@ -49,9 +39,7 @@ def _get_library_view_mode_pref():
 def _set_library_view_mode_pref(mode):
     if mode not in LIBRARY_VIEW_MODES:
         return
-    prefs = _load_prefs()
-    prefs["library_view_mode"] = mode
-    _save_prefs(prefs)
+    _save_pref("library_view_mode", mode)
 
 
 def _make_flow_grid():
@@ -316,8 +304,10 @@ class LibraryPage(Adw.Bin):
         self.main_box.append(loading_overlay)
         self.set_child(self.main_box)
 
-        self.load_library()
-        self.uploads_page.load()
+        # Library and uploads are populated lazily when this tab is first
+        # mapped.  The old eager calls made app startup render hundreds of
+        # rows and launch network work even when the user opened Home.
+        self._initial_load_started = False
 
         self.loading_row_spinner = None
         self.player.connect("state-changed", self.on_player_state_changed)
@@ -327,8 +317,18 @@ class LibraryPage(Adw.Bin):
         # Without this, the first paint always shows the ListBox because
         # the breakpoint handlers haven't run yet.
         self.connect("map", self._on_mapped_for_layout)
+        self.connect("notify::visible", self._on_library_visibility_changed)
+
+    def _on_library_visibility_changed(self, *_):
+        if self.get_mapped() and not self._initial_load_started:
+            self._on_mapped_for_layout()
 
     def _on_mapped_for_layout(self, *args):
+        if not self._initial_load_started:
+            self._initial_load_started = True
+            self.load_library()
+            if hasattr(self.uploads_page, "load"):
+                self.uploads_page.load()
         root = self.get_root()
         compact = bool(getattr(root, "_is_compact", False)) if root else False
         self._apply_library_layout(compact)

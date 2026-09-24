@@ -11,6 +11,14 @@ from gi.repository import Gtk, Gdk, Adw, GObject, Gio, GLib, Pango
 from player.player import Player
 from version import APP_VERSION
 from ui import color_utils
+from ui.preferences import (
+    get_bool,
+    get_float,
+    get_int,
+    read_prefs,
+    update_prefs,
+    user_prefs_path,
+)
 from ui.util_classes import ScrolledWindow
 
 
@@ -322,6 +330,7 @@ class MainWindow(Adw.ApplicationWindow):
         from ui.queue_panel import QueuePanel
 
         self.player = Player()
+        self.connect("destroy", self._on_player_destroy)
 
         self.player.download_manager.connect("progress", self._on_download_progress)
         self.player.download_manager.connect("complete", self._on_download_complete)
@@ -412,8 +421,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.desktop_cover_view.connect("dismiss", self._on_player_dismissed)
         self.main_stack.add_named(self.desktop_cover_view, "cover")
         
-        self.player.connect("metadata-changed", self._on_player_metadata_sync)
-
         self.bottom_sheet.connect("notify::open", self._on_bottom_sheet_open_changed)
 
         # The bottom bar is drawn over the content, not above it, so the
@@ -460,13 +467,20 @@ class MainWindow(Adw.ApplicationWindow):
         # Set by _set_dynamic_accent while the cover-derived accent is
         # active; None means libadwaita's own accent is in force.
         self._accent_override = None
+        self._last_accent_key = None
         # Typical luminance of the blurred backdrop currently painted,
         # measured by cover_effects; None when there isn't one.
         self._blur_backdrop = None
         # Pending _do_refresh_derived_colors idle, 0 when none.
         self._derived_refresh_id = 0
+        self._lyrics_theme_refresh_id = 0
         self._refresh_derived_colors()
         self._last_cover_url = None
+        self._appearance_generation = 0
+        self._blur_request_generation = 0
+        self._accent_request_generation = 0
+        self._blur_cancel_event = threading.Event()
+        self._accent_cancel_event = threading.Event()
         # Hook metadata for the appearance pipeline (blur + dynamic accent).
         # Applied immediately if either pref is already on at startup.
         self.player.connect("metadata-changed", self._on_metadata_for_appearance)
@@ -476,16 +490,39 @@ class MainWindow(Adw.ApplicationWindow):
         # Each moves the background or the color measured against.
         try:
             self._style_manager = Adw.StyleManager.get_default()
-            self._style_manager.connect(
-                "notify::dark", self._on_color_scheme_changed
-            )
-            for prop in ("accent-color", "high-contrast"):
-                self._style_manager.connect(
-                    f"notify::{prop}",
-                    lambda *_: self._refresh_derived_colors(),
-                )
         except Exception:
             self._style_manager = None
+        if self._style_manager is not None:
+            # `high-contrast` is read-only on libadwaita; keep the system
+            # notification for the "follow system" case, but do not try to
+            # write the property.  Accent-color is optional on older GTK.
+            try:
+                self._style_manager.connect(
+                    "notify::dark", self._on_color_scheme_changed
+                )
+            except Exception:
+                pass
+            for prop, callback in (
+                ("accent-color", lambda *_: self._refresh_derived_colors()),
+                ("high-contrast", self._on_system_high_contrast_changed),
+            ):
+                try:
+                    self._style_manager.connect(f"notify::{prop}", callback)
+                except Exception:
+                    pass
+
+        # Runtime appearance/performance state.  The preference file remains
+        # the source of truth, but the effective state is kept on the window
+        # so a low-power session can suppress expensive effects without
+        # overwriting the user's normal choices.
+        appearance_prefs = self._read_appearance_prefs()
+        self._accent_preset = appearance_prefs.get("accent_source", "system")
+        self._low_power_mode = appearance_prefs.get("low_power_mode", False)
+        self._reduce_motion = appearance_prefs.get("reduce_motion", False)
+        self._high_contrast = False
+        self._apply_high_contrast(appearance_prefs.get("high_contrast"))
+        self._apply_accent_preset()
+        self._apply_performance_mode(initial=True)
         self._apply_appearance_prefs_initial()
 
         self.init_pages()
@@ -620,50 +657,200 @@ class MainWindow(Adw.ApplicationWindow):
 
     # ─── Cover-derived appearance (blurred bg + dynamic accent) ───────────
 
-    def _read_appearance_prefs(self):
-        """Return a small dict of just the appearance prefs we care about."""
-        import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
-        prefs = {}
+    @staticmethod
+    def _load_css(provider, text):
+        """Load CSS on GTK versions with either the string or bytes API."""
         try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    prefs = _json.load(f)
-        except Exception:
-            pass
+            provider.load_from_string(text)
+        except (AttributeError, TypeError):
+            provider.load_from_data(text.encode("utf-8"))
+
+    def _read_appearance_prefs(self):
+        """Return the small, effective appearance/performance preference set."""
+
+        prefs = read_prefs(user_prefs_path(), {})
+        low_power = get_bool(prefs, "low_power_mode", False)
+        legacy_dynamic_accent = get_bool(prefs, "dynamic_accent", False)
+        source = str(prefs.get("accent_source", "") or "").strip().lower()
+        if source not in {"system", "cover", "custom"}:
+            # Preserve the legacy dynamic-accent switch for existing installs.
+            source = "cover" if legacy_dynamic_accent else "system"
+        # ``accent_source`` is the canonical setting.  The old boolean is
+        # retained as a compatibility export, but a valid new value must not
+        # be silently disabled by a stale legacy key left by another build.
+        dynamic_accent = source == "cover" and not low_power
         return {
-            "blurred_background": bool(prefs.get("blurred_background", False)),
-            "dynamic_accent": bool(prefs.get("dynamic_accent", False)),
-            "tinted_background": bool(prefs.get("tinted_background", False)),
+            "blurred_background": (
+                get_bool(prefs, "blurred_background", False) and not low_power
+            ),
+            "dynamic_accent": dynamic_accent,
+            "tinted_background": (
+                get_bool(prefs, "tinted_background", False) and not low_power
+            ),
+            "accent_source": source,
+            "accent_color": str(prefs.get("accent_color", "") or ""),
+            "high_contrast": (
+                get_bool(prefs, "high_contrast", False)
+                if "high_contrast" in prefs
+                else None
+            ),
+            "tint_strength": self._clamp_pref_float(
+                prefs.get("tint_strength", 1.0), 0.0, 2.0, 1.0
+            ),
+            "low_power_mode": low_power,
+            "reduce_motion": get_bool(prefs, "reduce_motion", False) or low_power,
+            "visualizer_enabled": (
+                get_bool(prefs, "visualizer_enabled", True) and not low_power
+            ),
+            "precache_next": get_bool(prefs, "precache_next", True)
+            and not low_power,
         }
+
+    @staticmethod
+    def _clamp_pref_float(value, low, high, default):
+        return get_float({"value": value}, "value", default, low, high)
+
+    def _apply_motion_durations(self, reduce_motion):
+        for widget_name, normal in (
+            ("main_stack", 300),
+            ("player_bar_revealer", 200),
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                try:
+                    widget.set_transition_duration(
+                        0 if reduce_motion else normal
+                    )
+                except Exception:
+                    pass
+
+    def _apply_performance_mode(self, initial=False):
+        """Apply low-power/reduced-motion switches without losing settings."""
+
+        prefs = self._read_appearance_prefs()
+        low_power = bool(prefs.get("low_power_mode", False))
+        reduce_motion = bool(prefs.get("reduce_motion", False)) or low_power
+        self._low_power_mode = low_power
+        self._reduce_motion = reduce_motion
+        from ui.utils import set_image_cache_limit
+        set_image_cache_limit(6 if low_power else 12)
+        if low_power:
+            self.add_css_class("low-power")
+        else:
+            self.remove_css_class("low-power")
+        if reduce_motion:
+            self.add_css_class("reduce-motion")
+        else:
+            self.remove_css_class("reduce-motion")
+        self._apply_motion_durations(reduce_motion)
+
+        if hasattr(self, "player"):
+            self.player.set_low_power_mode(low_power)
+            raw_reduce_motion = get_bool(
+                read_prefs(user_prefs_path(), {}), "reduce_motion", False
+            )
+            if hasattr(self.player, "set_reduce_motion"):
+                self.player.set_reduce_motion(raw_reduce_motion)
+            self.player.set_precache_enabled(prefs.get("precache_next", True))
+            for viz in self._get_visualizers():
+                viz.set_visible(prefs.get("visualizer_enabled", True))
+                viz.set_active(
+                    prefs.get("visualizer_enabled", True)
+                    and self.player.get_state_string() == "playing"
+                )
+            # Lyrics keep their saved effect preference, but low-power mode
+            # temporarily renders the cheap/effect-free variant.  Re-read it
+            # here so toggling the switch does not require a restart.
+            for view in self._lyrics_views():
+                view.apply_display_prefs()
+
+        if low_power:
+            self._deactivate_cover_bg()
+            if self._read_appearance_prefs().get("accent_source") != "custom":
+                self._clear_dynamic_accent()
+        elif not initial:
+            self._apply_accent_preset()
+            if self._last_cover_url and prefs.get("blurred_background"):
+                self._update_blurred_background(self._last_cover_url)
+
+    def _parse_accent_color(self, value):
+        try:
+            value = str(value or "").strip()
+            if len(value) == 7 and value.startswith("#"):
+                return color_utils.from_hex(value)
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _apply_custom_accent(self, value=None):
+        prefs = self._read_appearance_prefs()
+        rgb = self._parse_accent_color(
+            prefs.get("accent_color", "") if value is None else value
+        )
+        if rgb is not None:
+            self._set_dynamic_accent(
+                rgb,
+                source="custom",
+                source_key=("custom", prefs.get("accent_color", "")),
+            )
+        else:
+            self._clear_dynamic_accent()
+
+    def _apply_accent_preset(self):
+        """Apply the non-cover accent modes without starting image work."""
+
+        prefs = self._read_appearance_prefs()
+        source = prefs.get("accent_source", "system")
+        self._accent_preset = source
+        if source == "custom":
+            self._apply_custom_accent()
+        elif source == "cover":
+            if self._last_cover_url and prefs.get("dynamic_accent"):
+                self._update_dynamic_accent(self._last_cover_url)
+            else:
+                self._clear_dynamic_accent()
+        else:
+            self._clear_dynamic_accent()
 
     def _on_metadata_for_appearance(self, player, title, artist, thumb_url, video_id, like_status):
         # If the queue is empty or there's no cover (stopped, cleared),
         # tear cover-bg down completely so the app falls back to the
         # normal theme bg / accent.
+        prefs = self._read_appearance_prefs()
         queue_empty = not getattr(player, "queue", None)
         if not thumb_url or queue_empty:
             self._last_cover_url = None
             self._deactivate_cover_bg()
-            self._clear_dynamic_accent()
+            if prefs.get("accent_source") == "custom":
+                self._apply_custom_accent()
+            else:
+                self._clear_dynamic_accent()
             return
         same_cover = (thumb_url == self._last_cover_url)
         self._last_cover_url = thumb_url
-        
-        prefs = self._read_appearance_prefs()
+
         if prefs["blurred_background"] and not same_cover:
             self._activate_cover_bg(thumb_url)
         elif prefs["blurred_background"]:
             self.add_css_class("cover-bg-active")
 
-        if prefs["dynamic_accent"] and not same_cover:
+        source = prefs.get("accent_source", "system")
+        if source == "custom":
+            self._apply_custom_accent()
+        elif source == "cover" and prefs["dynamic_accent"] and not same_cover:
             self._update_dynamic_accent(thumb_url)
+        elif source != "cover" and not same_cover:
+            self._clear_dynamic_accent()
 
     def _activate_cover_bg(self, thumb_url):
         """Mark the window as cover-bg-active and load the override CSS
         right away, before the blur is even computed. That way the chrome
         becomes translucent immediately instead of waiting for the PIL
         blur thread to finish. The bg image is added on top when ready."""
+        if self._low_power_mode or not self._read_appearance_prefs().get(
+            "blurred_background", False
+        ):
+            return False
         self.add_css_class("cover-bg-active")
         print("[BLUR] activated cover-bg-active class")
         # Load the override stylesheet by itself if the provider is empty.
@@ -677,7 +864,7 @@ class MainWindow(Adw.ApplicationWindow):
             current = ""
         if not current:
             try:
-                self._dynamic_bg_css.load_from_string(_BLUR_OVERRIDE_CSS)
+                self._load_css(self._dynamic_bg_css, _BLUR_OVERRIDE_CSS)
             except Exception:
                 pass
         self._update_blurred_background(thumb_url)
@@ -685,6 +872,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _deactivate_cover_bg(self):
         """Remove the cover-bg-active class and clear the CSS provider so
         the chrome returns to its opaque default."""
+        self._blur_request_generation += 1
+        self._blur_cancel_event.set()
+        self._blur_cancel_event = threading.Event()
         self.remove_css_class("cover-bg-active")
         self._blur_backdrop = None
         self._clear_blurred_background()
@@ -699,7 +889,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_cover_url = thumb
         if prefs["blurred_background"]:
             self._activate_cover_bg(thumb)
-        if prefs["dynamic_accent"]:
+        source = prefs.get("accent_source", "system")
+        if source == "custom":
+            self._apply_custom_accent()
+        elif source == "cover" and prefs["dynamic_accent"]:
             self._update_dynamic_accent(thumb)
 
     def _on_color_scheme_changed(self, *_):
@@ -709,21 +902,52 @@ class MainWindow(Adw.ApplicationWindow):
         # Re-run them, or the chrome stays on the old scheme's values
         # until the next track change.
         prefs = self._read_appearance_prefs()
-        
-        if prefs.get("dynamic_accent") and getattr(self, "_last_dominant_rgb", None):
-            self._set_dynamic_accent(self._last_dominant_rgb)
-        elif prefs.get("dynamic_accent") and self._last_cover_url:
+        source = prefs.get("accent_source", "system")
+
+        if source == "custom":
+            self._apply_custom_accent()
+        elif (
+            source == "cover"
+            and prefs.get("dynamic_accent")
+            and getattr(self, "_last_dominant_rgb", None)
+            and getattr(self, "_last_accent_key", None) == ("cover", self._last_cover_url)
+        ):
+            self._set_dynamic_accent(
+                self._last_dominant_rgb,
+                source="cover",
+                source_key=("cover", self._last_cover_url),
+            )
+        elif source == "cover" and prefs.get("dynamic_accent") and self._last_cover_url:
             self._accent_override = None
             self._update_dynamic_accent(self._last_cover_url)
+        elif source == "system":
+            self._clear_dynamic_accent()
     
         if prefs.get("blurred_background") and self._last_cover_url:
             self._update_blurred_background(self._last_cover_url)
     
         self._refresh_derived_colors()
+        self._schedule_lyrics_theme_colors()
+
     def _update_blurred_background(self, thumb_url):
         from ui.cover_effects import get_blurred_cover
 
+        if self._low_power_mode or not self._read_appearance_prefs().get(
+            "blurred_background", False
+        ):
+            self._deactivate_cover_bg()
+            return False
+
+        self._blur_request_generation += 1
+        self._blur_cancel_event.set()
+        cancel_event = self._blur_cancel_event = threading.Event()
+        request = self._blur_request_generation
+
         def _apply(path, backdrop=None):
+            if request != self._blur_request_generation:
+                return False
+            if not self._read_appearance_prefs().get("blurred_background"):
+                return False
             if not path or not os.path.exists(path):
                 self._blur_backdrop = None
                 self._deactivate_cover_bg()
@@ -736,7 +960,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._refresh_derived_colors()
             return False
 
-        get_blurred_cover(thumb_url, dark=self._is_dark(), callback=_apply)
+        get_blurred_cover(
+            thumb_url,
+            dark=self._is_dark(),
+            callback=_apply,
+            cancel_event=cancel_event,
+        )
 
     def _set_blurred_background_css(self, path):
         from pathlib import Path
@@ -755,24 +984,56 @@ class MainWindow(Adw.ApplicationWindow):
             "}\n"
         )
         try:
-            self._dynamic_bg_css.load_from_string(_BLUR_OVERRIDE_CSS + bg_rule)
+            self._load_css(self._dynamic_bg_css, _BLUR_OVERRIDE_CSS + bg_rule)
         except Exception as e:
             print(f"[appearance] bg CSS load failed: {e}")
 
     def _clear_blurred_background(self):
-        self._dynamic_bg_css.load_from_string("")
+        self._load_css(self._dynamic_bg_css, "")
 
     def _update_dynamic_accent(self, thumb_url):
         from ui.cover_effects import get_dominant_color
 
+        self._accent_request_generation += 1
+        self._accent_cancel_event.set()
+        cancel_event = self._accent_cancel_event = threading.Event()
+        request = self._accent_request_generation
+        prefs = self._read_appearance_prefs()
+        if (
+            self._low_power_mode
+            or prefs.get("accent_source") != "cover"
+            or not prefs.get("dynamic_accent")
+        ):
+            # Invalidate callbacks already in flight, but do not start a
+            # cover download/PIL pass for a mode that has disabled it.
+            return False
+
         def _apply(rgb):
+            if request != self._accent_request_generation:
+                return False
+            current = self._read_appearance_prefs()
+            if (
+                self._low_power_mode
+                or current.get("accent_source") != "cover"
+                or not current.get("dynamic_accent")
+            ):
+                return False
             if not rgb:
                 self._clear_dynamic_accent()
                 return False
-            self._set_dynamic_accent(rgb)
+            self._set_dynamic_accent(
+                rgb,
+                source="cover",
+                source_key=("cover", thumb_url),
+            )
             return False
 
-        get_dominant_color(thumb_url, callback=_apply)
+        get_dominant_color(
+            thumb_url,
+            callback=_apply,
+            cancel_event=cancel_event,
+        )
+        return True
 
     def _is_dark(self):
         sm = getattr(self, "_style_manager", None) or Adw.StyleManager.get_default()
@@ -781,20 +1042,59 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception:
             return True
 
+    def _system_high_contrast(self):
+        sm = getattr(self, "_style_manager", None)
+        if sm is None:
+            return False
+        try:
+            return bool(sm.get_high_contrast())
+        except Exception:
+            return False
+
+    def _apply_high_contrast(self, value=None):
+        """Apply the app-local override, or follow the system setting."""
+
+        if value is None:
+            value = self._read_appearance_prefs().get("high_contrast")
+        if value is None:
+            value = self._system_high_contrast()
+        self._high_contrast = bool(value)
+        if self._high_contrast:
+            self.add_css_class("high-contrast")
+        else:
+            self.remove_css_class("high-contrast")
+        self._refresh_derived_colors()
+        self._schedule_lyrics_theme_colors()
+
+    def _on_system_high_contrast_changed(self, *_):
+        # An explicit app preference remains authoritative; otherwise follow
+        # the read-only system setting.
+        if self._read_appearance_prefs().get("high_contrast") is None:
+            self._apply_high_contrast(None)
+        else:
+            self._refresh_derived_colors()
+
     def _contrast_target(self):
         """Contrast ratio every derived text color has to clear. AA
-        normally, AAA under high contrast."""
-        try:
-            if Adw.StyleManager.get_default().get_high_contrast():
-                return color_utils.WCAG_AAA
-        except Exception:
-            pass
+        normally, AAA under the app-local or system high-contrast mode."""
+        if getattr(self, "_high_contrast", False):
+            return color_utils.WCAG_AAA
         return color_utils.WCAG_AA
 
-    def _set_dynamic_accent(self, rgb):
-        self._last_dominant_rgb = rgb
+    def _set_dynamic_accent(self, rgb, source=None, source_key=None):
         prefs = self._read_appearance_prefs()
-        
+        source = source or prefs.get("accent_source", "system")
+        if source == "cover" and self._low_power_mode:
+            return False
+        self._last_dominant_rgb = rgb
+        if source_key is None:
+            source_key = (
+                ("cover", self._last_cover_url)
+                if source == "cover"
+                else ("custom", prefs.get("accent_color", ""))
+            )
+        self._last_accent_key = source_key
+
         is_dark = self._is_dark()
 
         solid = color_utils.clamp_lightness(rgb, 0.45, 0.85)
@@ -806,25 +1106,35 @@ class MainWindow(Adw.ApplicationWindow):
         )
         
         standalone = color_utils.ensure_contrast(solid, view_bg, self._contrast_target())
-        tinted = prefs.get("dynamic_accent", False) and prefs.get("tinted_background", False)
+        tint_strength = self._clamp_pref_float(
+            prefs.get("tint_strength", 1.0), 0.0, 2.0, 1.0
+        )
+        tinted = (
+            prefs.get("tinted_background", False)
+            and source in ("cover", "custom")
+            and tint_strength > 0.01
+        )
         tint_vars = ""
 
         if tinted:
+            dark_tint = 0.10 * tint_strength
+            light_tint = 0.12 * tint_strength
+            card_tint = 0.06 * tint_strength
             if is_dark:
-                tint_vars = """
-                @define-color window_bg_color mix(#111113, @accent_bg_color, 0.10);
-                @define-color view_bg_color mix(#0e0e10, @accent_bg_color, 0.10);
-                @define-color headerbar_bg_color mix(#171719, @accent_bg_color, 0.10);
-                @define-color headerbar_backdrop_color mix(#111113, @accent_bg_color, 0.10);
-                @define-color popover_bg_color mix(#1b1b1d, @accent_bg_color, 0.10);
-                @define-color dialog_bg_color mix(#1b1b1d, @accent_bg_color, 0.10);
-                @define-color card_bg_color mix(rgba(255, 255, 255, 0.08), @accent_bg_color, 0.10);
-                @define-color sidebar_bg_color mix(#212123, @accent_bg_color, 0.10);
-                @define-color sidebar_backdrop_color mix(#1b1b1d, @accent_bg_color, 0.10);
-                @define-color sidebar_border_color mix(rgba(0, 0, 0, 0.36), @accent_bg_color, 0.10);
-                @define-color secondary_sidebar_bg_color mix(#1a1a1c, @accent_bg_color, 0.10);
-                @define-color secondary_sidebar_backdrop_color mix(#161618, @accent_bg_color, 0.10);
-                @define-color secondary_sidebar_border_color mix(rgba(0, 0, 0, 0.25), @accent_bg_color, 0.10);
+                tint_vars = f"""
+                @define-color window_bg_color mix(#111113, @accent_bg_color, {dark_tint:.3f});
+                @define-color view_bg_color mix(#0e0e10, @accent_bg_color, {dark_tint:.3f});
+                @define-color headerbar_bg_color mix(#171719, @accent_bg_color, {dark_tint:.3f});
+                @define-color headerbar_backdrop_color mix(#111113, @accent_bg_color, {dark_tint:.3f});
+                @define-color popover_bg_color mix(#1b1b1d, @accent_bg_color, {dark_tint:.3f});
+                @define-color dialog_bg_color mix(#1b1b1d, @accent_bg_color, {dark_tint:.3f});
+                @define-color card_bg_color mix(rgba(255, 255, 255, 0.08), @accent_bg_color, {dark_tint:.3f});
+                @define-color sidebar_bg_color mix(#212123, @accent_bg_color, {dark_tint:.3f});
+                @define-color sidebar_backdrop_color mix(#1b1b1d, @accent_bg_color, {dark_tint:.3f});
+                @define-color sidebar_border_color mix(rgba(0, 0, 0, 0.36), @accent_bg_color, {dark_tint:.3f});
+                @define-color secondary_sidebar_bg_color mix(#1a1a1c, @accent_bg_color, {dark_tint:.3f});
+                @define-color secondary_sidebar_backdrop_color mix(#161618, @accent_bg_color, {dark_tint:.3f});
+                @define-color secondary_sidebar_border_color mix(rgba(0, 0, 0, 0.25), @accent_bg_color, {dark_tint:.3f});
     
                 @define-color panel_bg_color @window_bg_color;
                 @define-color panel_button_bg_color transparent;
@@ -836,20 +1146,20 @@ class MainWindow(Adw.ApplicationWindow):
                 @define-color theme_selected_fg_color @accent_fg_color;
                 """
             else:
-                tint_vars = """
-                @define-color window_bg_color mix(#fafafb, @accent_bg_color, 0.12);
-                @define-color view_bg_color mix(#ffffff, @accent_bg_color, 0.12);
-                @define-color headerbar_bg_color mix(#ffffff, @accent_bg_color, 0.12);
-                @define-color headerbar_backdrop_color mix(#fafafb, @accent_bg_color, 0.12);
-                @define-color popover_bg_color mix(#ffffff, @accent_bg_color, 0.12);
-                @define-color dialog_bg_color mix(#fafafb, @accent_bg_color, 0.12);
-                @define-color card_bg_color mix(#ffffff, @accent_bg_color, 0.06);
-                @define-color sidebar_bg_color mix(#ebebed, @accent_bg_color, 0.12);
-                @define-color sidebar_backdrop_color mix(#f2f2f4, @accent_bg_color, 0.12);
-                @define-color sidebar_border_color mix(rgba(0, 0, 3, 0.07), @accent_bg_color, 0.12);
-                @define-color secondary_sidebar_bg_color mix(#f3f3f5, @accent_bg_color, 0.12);
-                @define-color secondary_sidebar_backdrop_color mix(#f6f6fa, @accent_bg_color, 0.12);
-                @define-color secondary_sidebar_border_color mix(rgba(0, 0, 0, 0.07), @accent_bg_color, 0.12);
+                tint_vars = f"""
+                @define-color window_bg_color mix(#fafafb, @accent_bg_color, {light_tint:.3f});
+                @define-color view_bg_color mix(#ffffff, @accent_bg_color, {light_tint:.3f});
+                @define-color headerbar_bg_color mix(#ffffff, @accent_bg_color, {light_tint:.3f});
+                @define-color headerbar_backdrop_color mix(#fafafb, @accent_bg_color, {light_tint:.3f});
+                @define-color popover_bg_color mix(#ffffff, @accent_bg_color, {light_tint:.3f});
+                @define-color dialog_bg_color mix(#fafafb, @accent_bg_color, {light_tint:.3f});
+                @define-color card_bg_color mix(#ffffff, @accent_bg_color, {card_tint:.3f});
+                @define-color sidebar_bg_color mix(#ebebed, @accent_bg_color, {light_tint:.3f});
+                @define-color sidebar_backdrop_color mix(#f2f2f4, @accent_bg_color, {light_tint:.3f});
+                @define-color sidebar_border_color mix(rgba(0, 0, 3, 0.07), @accent_bg_color, {light_tint:.3f});
+                @define-color secondary_sidebar_bg_color mix(#f3f3f5, @accent_bg_color, {light_tint:.3f});
+                @define-color secondary_sidebar_backdrop_color mix(#f6f6fa, @accent_bg_color, {light_tint:.3f});
+                @define-color secondary_sidebar_border_color mix(rgba(0, 0, 0, 0.07), @accent_bg_color, {light_tint:.3f});
     
                 @define-color panel_bg_color @window_bg_color;
                 @define-color panel_button_bg_color transparent;
@@ -897,25 +1207,34 @@ class MainWindow(Adw.ApplicationWindow):
         """
 
         try:
-            self.add_css_class("tinted")
-            self._dynamic_accent_css.load_from_string(css)
+            if tinted:
+                self.add_css_class("tinted")
+            else:
+                self.remove_css_class("tinted")
+            self._load_css(self._dynamic_accent_css, css)
         except Exception as e:
             print(f"[appearance] dynamic accent CSS load failed: {e}")
             return
 
         self._accent_override = (solid, standalone, view_bg)
         self._refresh_derived_colors()
+        self._schedule_lyrics_theme_colors()
 
     def _clear_dynamic_accent(self):
+        self._accent_request_generation += 1
+        self._accent_cancel_event.set()
+        self._accent_cancel_event = threading.Event()
         self._last_dominant_rgb = None
+        self._last_accent_key = None
         
         try:
-            self._dynamic_accent_css.load_from_string("")
+            self._load_css(self._dynamic_accent_css, "")
             self.remove_css_class("tinted")
         except Exception:
             pass
         self._accent_override = None
         self._refresh_derived_colors()
+        self._schedule_lyrics_theme_colors()
 
     # ─── Colors derived from whichever accent is in force ──────────────
 
@@ -1073,14 +1392,15 @@ class MainWindow(Adw.ApplicationWindow):
         )
 
         try:
-            self._derived_css.load_from_string(
+            self._load_css(
+                self._derived_css,
                 f"@define-color playing_fg {color_utils.to_css(fg)};\n"
                 f"@define-color blur_panel_bg {panel_color};\n"
                 f"@define-color blur_panel_bg_weak {panel_color_weak};\n"
                 f"@define-color toggle_checked_bg {toggle_checked};\n"
                 f"@define-color blur_sidebar_bg {sidebar_bg};\n"
                 f"@define-color visualizer_bar "
-                f"{color_utils.to_css(visualizer_bar)};\n"
+                f"{color_utils.to_css(visualizer_bar)};\n",
             )
         except Exception as e:
             print(f"[appearance] derived color CSS load failed: {e}")
@@ -1345,15 +1665,11 @@ class MainWindow(Adw.ApplicationWindow):
             and self.main_stack.get_visible_child_name() in ("player", "cover")
         ):
             self._on_player_dismissed(None)
-            from ui.utils import force_garbage_collect
-            GLib.timeout_add(500, force_garbage_collect)
             return
 
         nav = self._get_active_nav_view()
         if nav:
             nav.pop()
-            from ui.utils import force_garbage_collect
-            GLib.timeout_add(500, force_garbage_collect)
 
     def _build_avatar_menu_button(self):
         """Account button in the header bar — Bazaar-style.
@@ -2096,36 +2412,17 @@ class MainWindow(Adw.ApplicationWindow):
     }
 
     def _prefs_path(self):
-        return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
+        return user_prefs_path()
 
     def _load_color_scheme_pref(self):
-        import json as _json
-        try:
-            path = self._prefs_path()
-            if os.path.exists(path):
-                with open(path) as f:
-                    val = _json.load(f).get("color_scheme", "default")
-                if val in self._COLOR_SCHEME_MAP:
-                    return val
-        except Exception:
-            pass
-        return "default"
+        value = read_prefs(self._prefs_path(), {}).get("color_scheme", "default")
+        if not isinstance(value, str):
+            return "default"
+        return value if value in self._COLOR_SCHEME_MAP else "default"
 
     def _save_color_scheme_pref(self, value):
-        import json as _json
-        path = self._prefs_path()
-        data = {}
         try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    data = _json.load(f) or {}
-        except Exception:
-            data = {}
-        data["color_scheme"] = value
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                _json.dump(data, f)
+            update_prefs(self._prefs_path(), {"color_scheme": value})
         except Exception as e:
             print(f"[PREFS] failed to save color scheme: {e}")
 
@@ -2185,16 +2482,11 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _get_background_play_enabled(self):
-        import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
-        try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    return _json.load(f).get("background_play", True)
-        except Exception:
-            pass
-
-        return True
+        return get_bool(
+            read_prefs(self._prefs_path(), {}),
+            "background_play",
+            True,
+        )
 
     def _on_close_request(self, window):
         """Hide window instead of quitting if there are songs in the queue."""
@@ -2217,9 +2509,36 @@ class MainWindow(Adw.ApplicationWindow):
                 self._tray_icon = TrayIcon(self, self.player)
                 self._tray_icon.show()
 
+    def _on_player_destroy(self, *_):
+        """Release worker-owned playback resources when the window dies."""
+        if hasattr(self, "_blur_cancel_event"):
+            self._blur_request_generation += 1
+            self._blur_cancel_event.set()
+        if hasattr(self, "_accent_cancel_event"):
+            self._accent_request_generation += 1
+            self._accent_cancel_event.set()
+        if getattr(self, "_lyrics_theme_refresh_id", 0):
+            try:
+                GLib.source_remove(self._lyrics_theme_refresh_id)
+            except Exception:
+                pass
+            self._lyrics_theme_refresh_id = 0
+        if getattr(self, "_derived_refresh_id", 0):
+            try:
+                GLib.source_remove(self._derived_refresh_id)
+            except Exception:
+                pass
+            self._derived_refresh_id = 0
+        player = getattr(self, "player", None)
+        if player is not None and hasattr(player, "shutdown"):
+            try:
+                player.shutdown()
+            except Exception as exc:
+                print(f"[PLAYER] shutdown failed: {exc}")
+
     def _on_force_quit(self, action, param):
         """Force quit the application."""
-        self.player.stop()
+        self._on_player_destroy()
         app = self.get_application()
         if app:
             app.quit()
@@ -2244,15 +2563,7 @@ class MainWindow(Adw.ApplicationWindow):
         about.present(self)
 
     def _read_sidebar_position(self):
-        import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
-        side = "left"
-        try:
-            if os.path.exists(path):
-                with open(path) as f:
-                    side = _json.load(f).get("sidebar_position", "left")
-        except Exception:
-            pass
+        side = read_prefs(self._prefs_path(), {}).get("sidebar_position", "left")
         return Gtk.PackType.END if side == "right" else Gtk.PackType.START
 
     def _apply_window_controls_position(self):
@@ -2371,29 +2682,45 @@ class MainWindow(Adw.ApplicationWindow):
         app_group.add(stream_info_row)
 
         # Force offline mode
-        import json as _json
+        _prefs_path = user_prefs_path()
+        _prefs = read_prefs(_prefs_path, {})
+        _prefs_baseline = dict(_prefs)
 
-        _prefs_path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
-        _prefs = {}
-        try:
-            if os.path.exists(_prefs_path):
-                with open(_prefs_path) as f:
-                    _prefs = _json.load(f)
-        except Exception:
-            pass
+        def save_prefs_snapshot():
+            """Write only keys changed by this dialog, preserving live edits."""
+            changed = {
+                key: value
+                for key, value in _prefs.items()
+                if _prefs_baseline.get(key) != value
+            }
+            if changed:
+                try:
+                    merged = update_prefs(_prefs_path, changed)
+                except Exception as exc:
+                    print(f"[PREFS] failed to save settings: {exc}")
+                    return False
+                _prefs.clear()
+                _prefs.update(merged)
+                # The merge may contain keys changed by another process
+                # while this dialog was open.  Treat the complete returned
+                # snapshot as the new baseline; updating only ``changed``
+                # would make the next dialog write overwrite those live
+                # external edits with the stale in-memory value.
+                _prefs_baseline.clear()
+                _prefs_baseline.update(merged)
+                return True
+            return True
 
         offline_row = Adw.SwitchRow()
         offline_row.set_title("Force Offline Mode")
         offline_row.set_subtitle(
             "Disable all network requests and use only downloaded content"
         )
-        offline_row.set_active(_prefs.get("force_offline", False))
+        offline_row.set_active(get_bool(_prefs, "force_offline", False))
 
         def on_offline_toggled(switch, pspec):
             _prefs["force_offline"] = switch.get_active()
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             # is_online() caches the pref for 10 s. Without this the pages
             # reloaded below would read the value we just replaced.
             from ui.utils import invalidate_is_online_cache, probe_online_now
@@ -2417,13 +2744,13 @@ class MainWindow(Adw.ApplicationWindow):
         background_play_row = Adw.SwitchRow()
         background_play_row.set_title("Background Playback")
         background_play_row.set_subtitle("Allow music to keep playing when the window is closed")
-        background_play_row.set_active(_prefs.get("background_play", True))
+        background_play_row.set_active(
+            get_bool(_prefs, "background_play", True)
+        )
 
         def on_background_play_toggled(switch, pspec):
             _prefs["background_play"] = switch.get_active() 
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
         
         background_play_row.connect("notify::active", on_background_play_toggled)
         app_group.add(background_play_row)
@@ -2438,9 +2765,7 @@ class MainWindow(Adw.ApplicationWindow):
         def on_sidebar_position_toggled(switch, pspec):
             on_right = switch.get_active()
             _prefs["sidebar_position"] = "right" if on_right else "left"
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             if hasattr(self, "split_view"):
                 self.split_view.set_sidebar_position(
                     Gtk.PackType.END if on_right else Gtk.PackType.START
@@ -2478,9 +2803,7 @@ class MainWindow(Adw.ApplicationWindow):
             if not (0 <= idx < len(renderer_keys)):
                 return
             _prefs["gsk_renderer"] = renderer_keys[idx]
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
 
         renderer_row.connect("notify::selected", on_renderer_changed)
         app_group.add(renderer_row)
@@ -2511,9 +2834,7 @@ class MainWindow(Adw.ApplicationWindow):
             if idx < 0 or idx >= len(history_keys):
                 return
             _prefs["history_mode"] = history_keys[idx]
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             # Reflect the change live on the player so the next track
             # respects the new mode without a restart.
             if hasattr(self.player, "set_history_mode"):
@@ -2522,84 +2843,307 @@ class MainWindow(Adw.ApplicationWindow):
         history_row.connect("notify::selected", on_history_mode_changed)
         app_group.add(history_row)
 
-        # ── Appearance group (blurred bg + dynamic accent) ──────────────
+        # ── Appearance group (accent source, cover effects, tint) ───────
         appearance_group = Adw.PreferencesGroup()
         appearance_group.set_title("Appearance")
         page.add(appearance_group)
+
+        appearance = self._read_appearance_prefs()
+        # Runtime appearance reads are intentionally *effective* values
+        # (low-power can force effects off), but controls must show the raw
+        # saved choices so toggling a temporary override never rewrites them.
+        raw_blurred = get_bool(_prefs, "blurred_background", False)
+        raw_tinted = get_bool(_prefs, "tinted_background", False)
+        raw_visualizer = get_bool(_prefs, "visualizer_enabled", True)
+        raw_precache = get_bool(_prefs, "precache_next", True)
+        raw_reduce_motion = get_bool(_prefs, "reduce_motion", False)
+        low_power_saved = get_bool(_prefs, "low_power_mode", False)
+        accent_source_keys = ["system", "cover", "custom"]
+        accent_source_row = Adw.ComboRow()
+        accent_source_row.set_title("Accent Color")
+        accent_source_row.set_subtitle(
+            "Use the system accent, the current cover, or a custom color"
+        )
+        accent_source_row.set_model(
+            Gtk.StringList.new(["System", "Album Cover", "Custom Color"])
+        )
+        current_accent_source = appearance.get("accent_source", "system")
+        if current_accent_source in accent_source_keys:
+            accent_source_row.set_selected(accent_source_keys.index(current_accent_source))
+        appearance_group.add(accent_source_row)
+
+        custom_color_row = Adw.ActionRow()
+        custom_color_row.set_title("Custom Accent")
+        custom_color_row.set_subtitle("Used when Accent Color is set to Custom")
+        color_button = Gtk.ColorButton()
+        color_button.set_valign(Gtk.Align.CENTER)
+        color_button.set_use_alpha(False)
+        custom_rgba = Gdk.RGBA()
+        try:
+            custom_rgba.parse(_prefs.get("accent_color", "#3584e4"))
+        except Exception:
+            custom_rgba.parse("#3584e4")
+        color_button.set_rgba(custom_rgba)
+        custom_color_row.add_suffix(color_button)
+        custom_color_row.set_activatable_widget(color_button)
+        appearance_group.add(custom_color_row)
+
+        high_contrast_row = Adw.SwitchRow()
+        high_contrast_row.set_title("High Contrast")
+        high_contrast_row.set_subtitle(
+            "Increase VenTapes text and control contrast (system setting is used by default)"
+        )
+        try:
+            high_contrast_default = (
+                appearance.get("high_contrast")
+                if appearance.get("high_contrast") is not None
+                else (
+                    self._style_manager.get_high_contrast()
+                    if self._style_manager is not None
+                    else False
+                )
+            )
+            high_contrast_row.set_active(bool(high_contrast_default))
+        except Exception:
+            high_contrast_row.set_active(False)
+        appearance_group.add(high_contrast_row)
 
         blur_row = Adw.SwitchRow()
         blur_row.set_title("Blurred Cover Background")
         blur_row.set_subtitle(
             "Use the current track's cover as a blurred window background"
         )
-        blur_row.set_active(bool(_prefs.get("blurred_background", False)))
+        blur_row.set_active(raw_blurred)
+        appearance_group.add(blur_row)
 
-        def on_blur_toggled(switch, pspec):
+        # Retain the old switch as a compatibility-friendly cover shortcut.
+        accent_row = Adw.ExpanderRow(show_enable_switch=True)
+        accent_row.set_title("Album Cover Accent")
+        accent_row.set_subtitle("Match the app accent color to the current cover")
+        accent_row.set_enable_expansion(current_accent_source == "cover")
+        accent_row.set_expanded(current_accent_source == "cover")
+        appearance_group.add(accent_row)
+
+        tinted_row = Adw.SwitchRow()
+        tinted_row.set_title("Tinted Background")
+        tinted_row.set_subtitle("Tint app surfaces with the selected accent")
+        tinted_row.set_active(raw_tinted)
+        appearance_group.add(tinted_row)
+
+        tint_row = Adw.ActionRow()
+        tint_row.set_title("Tint Strength")
+        tint_row.set_subtitle("0% is subtle; 100% matches the original theme")
+        tint_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05
+        )
+        tint_scale.set_value(
+            self._clamp_pref_float(
+                _prefs.get("tint_strength", 1.0), 0.0, 2.0, 1.0
+            )
+        )
+        tint_scale.set_draw_value(True)
+        tint_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        tint_scale.set_digits(2)
+        tint_scale.set_size_request(220, -1)
+        tint_scale.set_valign(Gtk.Align.CENTER)
+        tint_row.add_suffix(tint_scale)
+        appearance_group.add(tint_row)
+
+        def _rgba_to_hex(rgba):
+            return "#{:02x}{:02x}{:02x}".format(
+                int(round(rgba.red * 255)),
+                int(round(rgba.green * 255)),
+                int(round(rgba.blue * 255)),
+            )
+
+        def _apply_tint():
+            source = self._read_appearance_prefs().get("accent_source", "system")
+            if source == "custom":
+                self._apply_custom_accent()
+            elif source == "cover" and self._last_cover_url:
+                self._update_dynamic_accent(self._last_cover_url)
+            elif source == "system":
+                self._clear_dynamic_accent()
+
+        accent_rows_syncing = False
+
+        def _sync_accent_rows(source):
+            nonlocal accent_rows_syncing
+            accent_rows_syncing = True
+            try:
+                accent_row.set_enable_expansion(source == "cover")
+                accent_row.set_expanded(source == "cover")
+                custom_color_row.set_sensitive(source == "custom")
+                tinted_row.set_sensitive(
+                    source in ("cover", "custom") and not self._low_power_mode
+                )
+                tint_row.set_sensitive(
+                    source in ("cover", "custom") and not self._low_power_mode
+                )
+            finally:
+                accent_rows_syncing = False
+
+        def _set_accent_source(source):
+            if source not in accent_source_keys:
+                source = "system"
+            if (
+                _prefs.get("accent_source") == source
+                and get_bool(_prefs, "dynamic_accent", False) == (source == "cover")
+            ):
+                _sync_accent_rows(source)
+                return
+            _prefs["accent_source"] = source
+            # Keep the legacy key meaningful for older versions and for code
+            # that has not migrated to the source selector yet.
+            _prefs["dynamic_accent"] = source == "cover"
+            save_prefs_snapshot()
+            accent_source_row.set_selected(accent_source_keys.index(source))
+            _sync_accent_rows(source)
+            if source == "custom":
+                self._apply_custom_accent()
+            elif source == "cover" and self._last_cover_url:
+                if (
+                    getattr(self, "_last_accent_key", None)
+                    and self._last_accent_key[0] != "cover"
+                ):
+                    self._clear_dynamic_accent()
+                self._update_dynamic_accent(self._last_cover_url)
+            else:
+                self._clear_dynamic_accent()
+
+        def on_accent_source_changed(row, _pspec):
+            idx = row.get_selected()
+            if 0 <= idx < len(accent_source_keys):
+                _set_accent_source(accent_source_keys[idx])
+
+        def on_accent_toggled(row, _pspec):
+            if accent_rows_syncing:
+                return
+            _set_accent_source("cover" if row.get_enable_expansion() else "system")
+
+        def on_custom_color_changed(button):
+            _prefs["accent_color"] = _rgba_to_hex(button.get_rgba())
+            save_prefs_snapshot()
+            if self._read_appearance_prefs().get("accent_source") == "custom":
+                self._apply_custom_accent(_prefs["accent_color"])
+
+        def on_high_contrast_toggled(switch, _pspec):
+            enabled = bool(switch.get_active())
+            _prefs["high_contrast"] = enabled
+            save_prefs_snapshot()
+            self._apply_high_contrast(enabled)
+
+        def on_blur_toggled(switch, _pspec):
             on = switch.get_active()
             _prefs["blurred_background"] = on
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
-            if on:
+            save_prefs_snapshot()
+            if on and not self._low_power_mode:
                 target = self._last_cover_url or getattr(self.player, "mpris_art_url", None)
                 if target and getattr(self.player, "queue", None):
                     self._activate_cover_bg(target)
             else:
                 self._deactivate_cover_bg()
 
-        blur_row.connect("notify::active", on_blur_toggled)
-        appearance_group.add(blur_row)
-        is_dynamic_active = bool(_prefs.get("dynamic_accent", False))
-        
-        accent_row = Adw.ExpanderRow(
-            show_enable_switch=True
-        )
-        accent_row.set_title("Dynamic Cover Color")
-        accent_row.set_subtitle(
-            "Match the app accent color to the current track's cover"
-        )
-        accent_row.set_enable_expansion(is_dynamic_active)
-        accent_row.set_expanded(is_dynamic_active)
+        def on_tinted_toggled(switch, _pspec):
+            _prefs["tinted_background"] = switch.get_active()
+            save_prefs_snapshot()
+            _apply_tint()
 
-        tinted_row = Adw.SwitchRow()
-        tinted_row.set_title("Tinted Background")
-        tinted_row.set_subtitle(
-            "Tint the app background with accent color"
-        )
-        tinted_row.set_active(bool(_prefs.get("tinted_background", False)))
+        tint_save_id = 0
 
-        def on_accent_toggled(row, pspec):
-            on = row.get_enable_expansion()
-            row.set_expanded(on)
+        def on_tint_changed(scale):
+            nonlocal tint_save_id
+            _prefs["tint_strength"] = float(scale.get_value())
+            if tint_save_id:
+                GLib.source_remove(tint_save_id)
+            # A slider emits many values while dragging.  Defer the disk
+            # write and provider reload until it settles.
+            tint_save_id = GLib.timeout_add(250, _commit_tint)
 
-            _prefs["dynamic_accent"] = on
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+        def _commit_tint():
+            nonlocal tint_save_id
+            tint_save_id = 0
+            save_prefs_snapshot()
+            _apply_tint()
+            return GLib.SOURCE_REMOVE
 
-            if on:
-                target = self._last_cover_url or getattr(self.player, "mpris_art_url", None)
-                if target:
-                    self._update_dynamic_accent(target)
-            else:
-                self._clear_dynamic_accent()
-
-        def on_tinted_toggled(switch, pspec):
-            on = switch.get_active()
-            _prefs["tinted_background"] = on
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
-
-            target = self._last_cover_url or getattr(self.player, "mpris_art_url", None)
-            if target and _prefs.get("dynamic_accent", False):
-                self._update_dynamic_accent(target)
-
+        accent_source_row.connect("notify::selected", on_accent_source_changed)
+        color_button.connect("color-set", on_custom_color_changed)
+        high_contrast_row.connect("notify::active", on_high_contrast_toggled)
         accent_row.connect("notify::enable-expansion", on_accent_toggled)
+        blur_row.connect("notify::active", on_blur_toggled)
         tinted_row.connect("notify::active", on_tinted_toggled)
+        tint_scale.connect("value-changed", on_tint_changed)
+        _sync_accent_rows(current_accent_source)
 
-        appearance_group.add(accent_row)
-        accent_row.add_row(tinted_row)
+        # ── Performance group ───────────────────────────────────────────
+        performance_group = Adw.PreferencesGroup()
+        performance_group.set_title("Performance")
+        performance_group.set_description(
+            "Reduce background work on battery-powered and low-end devices"
+        )
+        page.add(performance_group)
+
+        low_power_row = Adw.SwitchRow()
+        low_power_row.set_title("Low-power Mode")
+        low_power_row.set_subtitle(
+            "Disables expensive effects, spectrum analysis, and next-track preloading"
+        )
+        low_power_row.set_active(low_power_saved)
+        performance_group.add(low_power_row)
+
+        precache_row = Adw.SwitchRow()
+        precache_row.set_title("Pre-cache Next Tracks")
+        precache_row.set_subtitle(
+            "Resolve upcoming streams in advance for faster skipping"
+        )
+        precache_row.set_active(raw_precache)
+        precache_row.set_sensitive(not low_power_row.get_active())
+        performance_group.add(precache_row)
+
+        reduce_motion_row = Adw.SwitchRow()
+        reduce_motion_row.set_title("Reduce Motion")
+        reduce_motion_row.set_subtitle("Disable decorative UI transitions")
+        reduce_motion_row.set_active(raw_reduce_motion)
+        performance_group.add(reduce_motion_row)
+
+        def sync_power_rows(low_power):
+            low_power = bool(low_power)
+            precache_row.set_sensitive(not low_power)
+            blur_row.set_sensitive(not low_power)
+            tinted_row.set_sensitive(not low_power and _prefs.get("accent_source") in ("cover", "custom"))
+            tint_row.set_sensitive(not low_power and _prefs.get("accent_source") in ("cover", "custom"))
+            viz_enabled_row.set_sensitive(not low_power)
+            bars_row.set_sensitive(
+                not low_power and get_bool(_prefs, "visualizer_enabled", True)
+            )
+            smooth_row.set_sensitive(
+                not low_power and get_bool(_prefs, "visualizer_enabled", True)
+            )
+            reduce_motion_row.set_subtitle(
+                "Forced on while Low-power Mode is active"
+                if low_power else "Disable decorative UI transitions"
+            )
+
+        def on_low_power_toggled(switch, _pspec):
+            _prefs["low_power_mode"] = switch.get_active()
+            save_prefs_snapshot()
+            sync_power_rows(switch.get_active())
+            self._apply_performance_mode()
+
+        def on_precache_toggled(switch, _pspec):
+            _prefs["precache_next"] = switch.get_active()
+            save_prefs_snapshot()
+            self.player.set_precache_enabled(switch.get_active())
+
+        def on_reduce_motion_toggled(switch, _pspec):
+            _prefs["reduce_motion"] = switch.get_active()
+            save_prefs_snapshot()
+            self._apply_performance_mode()
+
+        low_power_row.connect("notify::active", on_low_power_toggled)
+        precache_row.connect("notify::active", on_precache_toggled)
+        reduce_motion_row.connect("notify::active", on_reduce_motion_toggled)
 
         # ── Visualizer group ────────────────────────────────────────────
         viz_group = Adw.PreferencesGroup()
@@ -2612,20 +3156,23 @@ class MainWindow(Adw.ApplicationWindow):
         viz_enabled_row = Adw.SwitchRow()
         viz_enabled_row.set_title("Enable Visualizer")
         viz_enabled_row.set_subtitle("Show audio bars beneath the cover art")
-        viz_enabled_row.set_active(bool(_prefs.get("visualizer_enabled", True)))
+        viz_enabled_row.set_active(raw_visualizer)
 
         def on_viz_enabled(switch, pspec):
-            on = switch.get_active()
+            on = bool(switch.get_active())
             _prefs["visualizer_enabled"] = on
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
 
+            self.player.set_visualizer_enabled(on)
             for viz in self._get_visualizers():
-                viz.set_visible(on)
+                viz.set_visible(on and not self._low_power_mode)
+                viz.set_active(
+                    on and not self._low_power_mode
+                    and self.player.get_state_string() == "playing"
+                )
 
-            bars_row.set_sensitive(on)
-            smooth_row.set_sensitive(on)
+            bars_row.set_sensitive(on and not self._low_power_mode)
+            smooth_row.set_sensitive(on and not self._low_power_mode)
 
         viz_enabled_row.connect("notify::active", on_viz_enabled)
         viz_group.add(viz_enabled_row)
@@ -2635,11 +3182,10 @@ class MainWindow(Adw.ApplicationWindow):
         bars_row.set_title("Bar Count")
         bars_row.set_subtitle("Number of bars in the visualizer (more = finer)")
 
-        bars_initial = int(_prefs.get("visualizer_bars", 56))
-        bars_initial = max(8, min(100, bars_initial))
+        bars_initial = get_int(_prefs, "visualizer_bars", 56, 8, 100)
 
         bars_scale = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 16, 100, 4
+            Gtk.Orientation.HORIZONTAL, 8, 100, 4
         )
         bars_scale.set_value(bars_initial)
         bars_scale.set_draw_value(True)
@@ -2650,12 +3196,24 @@ class MainWindow(Adw.ApplicationWindow):
         bars_scale.set_hexpand(False)
         bars_row.add_suffix(bars_scale)
 
+        visualizer_save_id = 0
+
+        def schedule_visualizer_save():
+            nonlocal visualizer_save_id
+            if visualizer_save_id:
+                GLib.source_remove(visualizer_save_id)
+            visualizer_save_id = GLib.timeout_add(250, _commit_visualizer_save)
+
+        def _commit_visualizer_save():
+            nonlocal visualizer_save_id
+            visualizer_save_id = 0
+            save_prefs_snapshot()
+            return GLib.SOURCE_REMOVE
+
         def on_bars_changed(scale):
             n = int(scale.get_value())
             _prefs["visualizer_bars"] = n
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            schedule_visualizer_save()
             for viz in self._get_visualizers():
                 viz.set_bar_count(n)
 
@@ -2668,8 +3226,9 @@ class MainWindow(Adw.ApplicationWindow):
             "Higher = tighter spikes, lower = peaks bleed into neighbors"
         )
 
-        smooth_initial = float(_prefs.get("visualizer_smoothing", 1.5))
-        smooth_initial = max(1.05, min(3.0, smooth_initial))
+        smooth_initial = get_float(
+            _prefs, "visualizer_smoothing", 1.8, 1.05, 3.0
+        )
 
         smooth_scale = Gtk.Scale.new_with_range(
             Gtk.Orientation.HORIZONTAL, 1.1, 3.0, 0.05
@@ -2686,18 +3245,17 @@ class MainWindow(Adw.ApplicationWindow):
         def on_smooth_changed(scale):
             v = float(scale.get_value())
             _prefs["visualizer_smoothing"] = v
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            schedule_visualizer_save()
             for viz in self._get_visualizers():
                 viz.set_smoothing(v)
 
         smooth_scale.connect("value-changed", on_smooth_changed)
         viz_group.add(smooth_row)
 
-        _viz_initial = bool(_prefs.get("visualizer_enabled", True))
-        bars_row.set_sensitive(_viz_initial)
+        _viz_initial = raw_visualizer
+        bars_row.set_sensitive(_viz_initial and not low_power_saved)
         smooth_row.set_sensitive(_viz_initial)
+        sync_power_rows(low_power_saved)
 
         from player.discord_rpc import (
             STATUS_DISPLAY_TYPES,
@@ -2724,7 +3282,9 @@ class MainWindow(Adw.ApplicationWindow):
         rpc_enabled_row.set_subtitle(
             "Uses VENTAPES_DISCORD_APP_ID; no upstream Discord application is reused"
         )
-        rpc_enabled_row.set_active(_prefs.get("discord_rpc_enabled", False))
+        rpc_enabled_row.set_active(
+            get_bool(_prefs, "discord_rpc_enabled", False)
+        )
         rpc_enabled_row.set_sensitive(bool(getattr(rpc_adapter, "app_id", "")))
 
         display_row = Adw.ComboRow()
@@ -2746,9 +3306,7 @@ class MainWindow(Adw.ApplicationWindow):
         def on_rpc_toggled(switch, pspec):
             enabled = switch.get_active()
             _prefs["discord_rpc_enabled"] = enabled
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             display_row.set_sensitive(enabled)
             small_icon_row.set_sensitive(enabled)
             if rpc_adapter:
@@ -2762,9 +3320,7 @@ class MainWindow(Adw.ApplicationWindow):
             idx = row.get_selected()
             if 0 <= idx < len(display_keys):
                 _prefs["discord_rpc_status_display"] = display_keys[idx]
-                os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-                with open(_prefs_path, "w") as f:
-                    _json.dump(_prefs, f)
+                save_prefs_snapshot()
                 if rpc_adapter and rpc_adapter._enabled:
                     rpc_adapter.update()
 
@@ -2774,14 +3330,14 @@ class MainWindow(Adw.ApplicationWindow):
         hide_pause_row = Adw.SwitchRow()
         hide_pause_row.set_title("Hide on Pause")
         hide_pause_row.set_subtitle("Hide Discord RPC when music is paused")
-        hide_pause_row.set_active(_prefs.get("discord_rpc_hide_pause_enabled", False))
+        hide_pause_row.set_active(
+            get_bool(_prefs, "discord_rpc_hide_pause_enabled", False)
+        )
         hide_pause_row.set_sensitive(rpc_enabled_row.get_active())
 
         def on_hide_pause_toggled(switch, pspec):
             _prefs["discord_rpc_hide_pause_enabled"] = switch.get_active()
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             if rpc_adapter and rpc_adapter._enabled:
                 rpc_adapter.update()
         
@@ -2793,16 +3349,16 @@ class MainWindow(Adw.ApplicationWindow):
         small_icon_row.set_subtitle(
             "Display a small play or pause indicator on the album art"
         )
-        small_icon_row.set_active(_prefs.get("discord_rpc_small_icon_enabled", True))
+        small_icon_row.set_active(
+            get_bool(_prefs, "discord_rpc_small_icon_enabled", True)
+        )
         small_icon_row.set_sensitive(
             rpc_enabled_row.get_active() and bool(getattr(rpc_adapter, "app_id", ""))
         )
 
         def on_small_icon_toggled(switch, pspec):
             _prefs["discord_rpc_small_icon_enabled"] = switch.get_active()
-            os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
-            with open(_prefs_path, "w") as f:
-                _json.dump(_prefs, f)
+            save_prefs_snapshot()
             if rpc_adapter and rpc_adapter._enabled:
                 rpc_adapter.update()
 
@@ -3211,6 +3767,20 @@ class MainWindow(Adw.ApplicationWindow):
                 views.append(view)
         return views
 
+    def _refresh_lyrics_theme_colors(self):
+        self._lyrics_theme_refresh_id = 0
+        for view in self._lyrics_views():
+            try:
+                view.refresh_theme_colors()
+            except Exception:
+                pass
+
+    def _schedule_lyrics_theme_colors(self):
+        if not self._lyrics_theme_refresh_id:
+            self._lyrics_theme_refresh_id = GLib.idle_add(
+                self._refresh_lyrics_theme_colors
+            )
+
     def _apply_lyrics_display_prefs(self):
         for view in self._lyrics_views():
             view.apply_display_prefs()
@@ -3336,7 +3906,6 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_scrobbler_group(self, prefs):
         """Build the 'Scrobbling' Adw.PreferencesGroup: a master switch plus
         a connect/disconnect row per service."""
-        import json as _json
         from player.scrobbler import SERVICE_LABELS
 
         group = Adw.PreferencesGroup()
@@ -3357,25 +3926,15 @@ class MainWindow(Adw.ApplicationWindow):
 
         def _read_pref(key, default):
             try:
-                if os.path.exists(prefs_path):
-                    with open(prefs_path) as f:
-                        return _json.load(f).get(key, default)
+                return get_bool(read_prefs(prefs_path, {}), key, default)
             except Exception:
-                pass
-            return default
+                return default
 
         def _save_pref(key, value):
-            data = {}
             try:
-                if os.path.exists(prefs_path):
-                    with open(prefs_path) as f:
-                        data = _json.load(f)
-            except Exception:
-                data = {}
-            data[key] = value
-            os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
-            with open(prefs_path, "w") as f:
-                _json.dump(data, f)
+                update_prefs(prefs_path, {key: value})
+            except Exception as exc:
+                print(f"[SCROBBLE] failed to save preference {key}: {exc}")
 
         def _toast(message):
             prefs.add_toast(Adw.Toast.new(message))
@@ -4205,26 +4764,6 @@ class MainWindow(Adw.ApplicationWindow):
         if hasattr(self, "home_page"):
             self.home_page.refresh()
 
-    def _on_player_metadata_sync(
-        self,
-        player,
-        title="",
-        artist="",
-        thumb_url=None,
-        video_id=None,
-        like_status="INDIFFERENT",
-        *args,
-    ):
-        if hasattr(self, "expanded_player") and hasattr(self.expanded_player, "on_metadata_changed"):
-            try:
-                self.expanded_player.on_metadata_changed(
-                    player, title, artist, thumb_url, video_id, like_status
-                )
-            except TypeError:
-                self.expanded_player.on_metadata_changed(
-                    title, artist, thumb_url, video_id, like_status
-                )
-
     def _on_bottom_sheet_open_changed(self, sheet, pspec):
         """Sincroniza o estado do player_bar caso o sheet seja fechado por gesto."""
         if not sheet.get_open() and hasattr(self, "player_bar"):
@@ -4422,7 +4961,9 @@ class MainWindow(Adw.ApplicationWindow):
                 return
             self._prev_main_transition = self.main_stack.get_transition_type()
             self._prev_main_duration = self.main_stack.get_transition_duration()
-            self.main_stack.set_transition_duration(200)
+            self.main_stack.set_transition_duration(
+                0 if self._reduce_motion else 200
+            )
             self.main_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
             self.main_stack.set_visible_child_name("cover")
             

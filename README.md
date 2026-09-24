@@ -107,6 +107,17 @@ The inherited Flatpak and Windows build recipes remain for study, but they are n
 - YouTube authentication stores sensitive cookies locally. The app creates its auth file with owner-only permissions on POSIX and requires an explicit file selection for imports. Use a separate account or an isolated test environment if that matters to you.
 - VenTapes is not a YouTube or Google client and does not imply any endorsement.
 
+## Performance and appearance
+
+Preferences now includes a **Performance** group for constrained devices:
+
+- **Low-power Mode** disables the cover blur/accent analysis, spectrum filter, decorative transitions, and next-track pre-resolution while the setting is active.
+- **Pre-cache Next Tracks** can be disabled independently when background yt-dlp work is more expensive than the faster skip it provides.
+- The progress display uses a slower adaptive timer when playback is idle or low-power mode is enabled.
+- Non-seekable/upload streams are staged locally with a 512 MiB aggregate cap. Set `VENTAPES_STAGING_MAX_MB` to lower or raise that cap for a deployment.
+
+Appearance supports System, Album Cover, and Custom accent colors, plus adjustable tint strength, high contrast, and reduced-motion options. Existing `dynamic_accent` preferences continue to map to Album Cover mode.
+
 ## License
 
 This modified work is distributed under the [GNU General Public License v3.0 or later](LICENSE). Mixtapes was created by Mohamad Obeid and its contributors; see the upstream project for the authoritative project history and contributor list.
