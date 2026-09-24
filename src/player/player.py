@@ -1,3 +1,6 @@
+# VenTapes (modified 2026-09-24) is based on Mixtapes and remains GPL-3.0-or-later.
+# See ../../NOTICE.md and ../../CREDITS.md.
+
 import gi
 import sys
 import threading
@@ -39,11 +42,10 @@ class _YdlLogger:
 
 def _find_botguard_bin():
     """Locate the rustypipe-botguard binary used by the yt-dlp PO-Token
-    provider (yt-dlp-get-pot-rustypipe). Our packaged builds (Flatpak, AUR,
-    the Windows installer) now ship the binary so users don't have to
-    `cargo install` it, so we check the bundled spots first, then PATH, then
-    the usual manual-install locations. Desktop launchers / frozen builds
-    often start with a PATH that omits ~/.cargo/bin, so we hand yt-dlp an
+    provider (yt-dlp-get-pot-rustypipe). Some inherited packaging recipes and
+    local builds may ship the binary, so we check the bundled spots first,
+    then PATH, then the usual manual-install locations. Desktop launchers /
+    frozen builds often start with a PATH that omits ~/.cargo/bin, so we hand yt-dlp an
     explicit path. Returns None if it isn't found anywhere — playback still
     works, only PO-Token-gated formats (e.g. seekable Opus) stay out of reach."""
     win = sys.platform == "win32"
@@ -84,7 +86,7 @@ def _find_botguard_bin():
         ]
     else:
         candidates = [
-            "/usr/lib/mixtapes/bin/" + name,   # AUR package's private libdir
+            "/usr/lib/ventapes/bin/" + name,   # Optional package's private libdir
             os.path.expanduser("~/.cargo/bin/" + name),
             "/usr/local/bin/" + name,
             "/usr/bin/" + name,
@@ -114,7 +116,7 @@ if sys.platform == "win32":
         pass
 else:
     try:
-        from player.mpris import MuseMprisAdapter, MuseServer, MuseEventAdapter
+        from player.mpris import VenTapesMprisAdapter, VenTapesServer, VenTapesEventAdapter
         HAS_MPRIS = True
     except ImportError:
         pass
@@ -236,7 +238,7 @@ class Player(GObject.Object):
 
     def __init__(self):
         super().__init__()
-        GLib.set_application_name("Mixtapes")
+        GLib.set_application_name("VenTapes")
         Gst.init(None)
         self.client = MusicClient()
         self.player = Gst.ElementFactory.make("playbin", "player")
@@ -442,8 +444,8 @@ class Player(GObject.Object):
         # boolean checker if media api (MPRIS or SMTC) is loaded
         self.media_api_loaded = False
 
-        # Discord Rich Presence (cross-platform; no-op if pypresence missing
-        # or Discord not running).
+        # Discord Rich Presence is opt-in and requires a VenTapes-specific
+        # application ID supplied through VENTAPES_DISCORD_APP_ID.
         try:
             self.discord_rpc = DiscordRPCAdapter(self)
             self.connect("state-changed", self._on_discord_state_changed)
@@ -470,9 +472,9 @@ class Player(GObject.Object):
 
         # MPRIS Setup (Linux-only, requires D-Bus)
         if HAS_MPRIS:
-            self.mpris_adapter = MuseMprisAdapter(self)
-            self.mpris_server = MuseServer("Mixtapes", adapter=self.mpris_adapter)
-            self.mpris_events = MuseEventAdapter(
+            self.mpris_adapter = VenTapesMprisAdapter(self)
+            self.mpris_server = VenTapesServer("VenTapes", adapter=self.mpris_adapter)
+            self.mpris_events = VenTapesEventAdapter(
                 self.mpris_server.root, self.mpris_server.player
             )
             self.mpris_server.set_event_adapter(self.mpris_events)
@@ -1625,7 +1627,7 @@ class Player(GObject.Object):
         (load_generation changes invalidate the result)."""
         import tempfile
 
-        tmp_dir = tempfile.mkdtemp(prefix="muse-stream-", dir=self._tmpfs_root())
+        tmp_dir = tempfile.mkdtemp(prefix="ventapes-stream-", dir=self._tmpfs_root())
         outtmpl = os.path.join(tmp_dir, f"{video_id}.%(ext)s")
 
         opts = self.ydl_opts.copy()
@@ -1690,7 +1692,7 @@ class Player(GObject.Object):
             return
         try:
             parent = os.path.dirname(path)
-            if parent and "muse-stream-" in parent:
+            if parent and "ventapes-stream-" in parent:
                 self._rm_tmpfs_dir(parent)
             elif os.path.exists(path):
                 os.remove(path)
@@ -1706,14 +1708,14 @@ class Player(GObject.Object):
         try:
             root = self._tmpfs_root()
             for name in os.listdir(root):
-                if name.startswith("muse-stream-"):
+                if name.startswith("ventapes-stream-"):
                     self._rm_tmpfs_dir(os.path.join(root, name))
         except OSError:
             pass
 
     def _noseek_vids_path(self):
         return os.path.join(
-            GLib.get_user_data_dir(), "muse", "noseek_vids.json"
+            GLib.get_user_data_dir(), "ventapes", "noseek_vids.json"
         )
 
     def _load_noseek_vids(self):
@@ -2210,9 +2212,9 @@ class Player(GObject.Object):
                     try:
                         source.set_property("extra-headers", extra)
                     except Exception as e:
-                        print(f"[PLAYER] set extra-headers failed: {e}")
+                        print(f"[PLAYER] set extra-headers failed ({type(e).__name__}).")
         except Exception as e:
-            print(f"[PLAYER] source-setup hook error: {e}")
+            print(f"[PLAYER] source-setup hook error ({type(e).__name__}).")
 
     def _start_playback(self, uri, cookie_file=None):
         self._current_play_uri = uri
@@ -2551,7 +2553,7 @@ class Player(GObject.Object):
                 MIN_ART_SIZE, MIN_ART_SIZE, GdkPixbuf.InterpType.BILINEAR
             )
 
-        cache_dir = os.path.join(GLib.get_user_cache_dir(), "mixtapes")
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), "ventapes")
         os.makedirs(cache_dir, exist_ok=True)
 
         # Cleanup old art files to prevent bloat and cache issues
@@ -2762,7 +2764,7 @@ class Player(GObject.Object):
         import os
         try:
             path = os.path.join(
-                GLib.get_user_data_dir(), "muse", "prefs.json"
+                GLib.get_user_data_dir(), "ventapes", "prefs.json"
             )
             if os.path.exists(path):
                 with open(path) as f:

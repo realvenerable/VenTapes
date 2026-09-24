@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.realvenerable.VenTapes</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>VenTapes</name>
+  <summary>Unofficial personal learning fork of Mixtapes</summary>
+
+  <description>
+    <p>
+      VenTapes is a private learning experiment based on Mixtapes, a GTK4 and
+      Libadwaita YouTube Music player by Mohamad Obeid and its contributors.
+      It exists to study, modify, break, and learn from the inherited code.
+    </p>
+    <p>
+      This is not an official release and is not intended for public use,
+      distribution, support, or dependable everyday operation. Use the upstream
+      Mixtapes project for a supported application.
+    </p>
+    <p>
+      VenTapes is unaffiliated with and not endorsed by the Mixtapes
+      maintainers, YouTube, or Google.
+    </p>
+  </description>
+
+  <developer id="io.github.realvenerable">
+    <name>realvenerable</name>
+  </developer>
+
+  <launchable type="desktop-id">io.github.realvenerable.VenTapes.desktop</launchable>
+
+  <url type="homepage">https://github.com/realvenerable/VenTapes</url>
+  <url type="vcs-browser">https://github.com/realvenerable/VenTapes</url>
+  <url type="help">https://github.com/m-obeid/Mixtapes</url>
+
+  <content_rating type="oars-1.1"/>
+
+  <!-- This metadata describes a private learning build, not a release. -->
+</component>

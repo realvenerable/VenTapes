@@ -62,7 +62,7 @@ _cache_mtime = -1.0
 
 
 def _path():
-    return os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
 
 
 def _read():

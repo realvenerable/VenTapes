@@ -10,23 +10,17 @@ import os
 import queue
 import threading
 import time
+import tempfile
 from urllib.parse import urlencode
 
+from version import APP_VERSION
 
-# Committed on purpose: AUR builds run on the user's machine and Flathub
-# builds run on Flathub's infrastructure, so neither receives a secret from CI,
-# and a key inside a shipped binary is extractable anyway. See the README.
-# The env vars override at run time, not at build time.
-# ListenBrainz needs no app credentials and works with these left empty.
-_EMBEDDED_LASTFM_API_KEY = "1aa73ecd8d085e53977fc8e781afa2fa"
-_EMBEDDED_LASTFM_API_SECRET = "51523d91a6e58babdb0b06b130f5ec45"
 
-LASTFM_API_KEY = (
-    os.environ.get("MIXTAPES_LASTFM_API_KEY") or _EMBEDDED_LASTFM_API_KEY
-)
-LASTFM_API_SECRET = (
-    os.environ.get("MIXTAPES_LASTFM_API_SECRET") or _EMBEDDED_LASTFM_API_SECRET
-)
+# Last.fm requires client credentials. VenTapes deliberately does not reuse
+# the upstream Mixtapes key/secret; register your own app and provide both
+# values at runtime. ListenBrainz needs no app credentials and remains usable.
+LASTFM_API_KEY = os.environ.get("VENTAPES_LASTFM_API_KEY", "").strip()
+LASTFM_API_SECRET = os.environ.get("VENTAPES_LASTFM_API_SECRET", "").strip()
 
 LASTFM_API_ROOT = "https://ws.audioscrobbler.com/2.0/"
 LASTFM_AUTH_URL = "https://www.last.fm/api/auth/"
@@ -35,7 +29,7 @@ LISTENBRAINZ_API_ROOT = "https://api.listenbrainz.org"
 SERVICES = ("lastfm", "listenbrainz")
 SERVICE_LABELS = {"lastfm": "Last.fm", "listenbrainz": "ListenBrainz"}
 
-USER_AGENT = "Mixtapes (https://pocoguy.com/#!/mixtapes)"
+USER_AGENT = f"VenTapes/{APP_VERSION} (+https://github.com/realvenerable/VenTapes)"
 
 # Last.fm's submission rules: never scrobble a track under 30 seconds, and
 # submit once half the track or 4 minutes has played, whichever is first.
@@ -84,7 +78,7 @@ class AuthError(PermanentError):
 def _data_dir():
     from gi.repository import GLib
 
-    return os.path.join(GLib.get_user_data_dir(), "muse")
+    return os.path.join(GLib.get_user_data_dir(), "ventapes")
 
 
 def _read_json(path, default):
@@ -100,19 +94,35 @@ def _read_json(path, default):
 
 
 def _write_json(path, data, private=False):
+    temporary_path = None
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        if private:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        if private and os.name == "posix":
             try:
-                os.chmod(tmp, 0o600)
+                os.chmod(directory, 0o700)
             except OSError:
                 pass
-        os.replace(tmp, path)
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=".scrobbler-", suffix=".tmp", dir=directory
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        else:
+            temporary_path = path + ".tmp"
+            with open(temporary_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+        if private and os.name == "posix":
+            os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
     except Exception as e:
-        print(f"[SCROBBLE] failed to write {os.path.basename(path)}: {e}")
+        print(f"[SCROBBLE] failed to write {os.path.basename(path)}: {type(e).__name__}")
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
 
 
 def _get_prefs():
@@ -650,8 +660,8 @@ class ScrobblerAdapter:
 
     def _listenbrainz_metadata(self, entry):
         info = {
-            "media_player": "Mixtapes",
-            "submission_client": "Mixtapes",
+            "media_player": "VenTapes",
+            "submission_client": "VenTapes",
             "music_service": "music.youtube.com",
         }
         if entry.get("duration"):

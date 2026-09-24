@@ -17,7 +17,7 @@ LIBRARY_VIEW_MODES = ("list", "grid")
 DEFAULT_LIBRARY_VIEW_MODE = "grid"
 
 def _prefs_path():
-    return os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
 
 
 def _load_prefs():

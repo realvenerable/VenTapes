@@ -1,6 +1,6 @@
 """
 Windows login helper integration.
-Launches the standalone MixtapesLogin.exe (Edge WebView2) and watches
+Launches the standalone VenTapesLogin.exe (Edge WebView2) and watches
 for the resulting credentials file.
 """
 
@@ -11,15 +11,15 @@ import threading
 
 def get_login_output_path():
     appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    return os.path.join(appdata, "Mixtapes", "login_headers.json")
+    return os.path.join(appdata, "ventapes", "headers_auth.json")
 
 
 def find_login_helper():
-    """Find MixtapesLogin.exe relative to the app."""
+    """Find VenTapesLogin.exe relative to the app."""
     base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     candidates = [
-        os.path.join(base, "windows", "MixtapesLogin.exe"),
-        os.path.join(base, "MixtapesLogin.exe"),
+        os.path.join(base, "windows", "VenTapesLogin.exe"),
+        os.path.join(base, "VenTapesLogin.exe"),
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -35,7 +35,7 @@ def launch_login(on_complete):
     """
     helper = find_login_helper()
     if not helper:
-        on_complete(None, "MixtapesLogin.exe not found")
+        on_complete(None, "VenTapesLogin.exe not found")
         return
 
     output_path = get_login_output_path()

@@ -1,5 +1,9 @@
 # Bundled Fonts
 
+These files are inherited build/runtime support from Mixtapes. VenTapes does
+not claim the font projects or redesigns as its own; their original licensing
+and notices remain in this directory.
+
 This directory ships **Adwaita Sans** and **Adwaita Mono** — the default
 typefaces used by libadwaita / GNOME. Both are derived from upstream
 projects (Inter and Iosevka respectively) and are licensed under the

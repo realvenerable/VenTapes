@@ -1,5 +1,5 @@
 {
-  description = "Python development setup with Nix for Mixtapes project";
+  description = "Personal learning development setup for the VenTapes fork of Mixtapes";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -11,11 +11,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = pkgs.lib.pipe (self + "/com.pocoguy.Muse.metainfo.xml") [
-          builtins.readFile
-          (builtins.match ".*<releases>[^<]*<release version=\"([^\"]+)\"[^>]*>.*")
-          builtins.head
-        ];
+        version = pkgs.lib.removeSuffix "\n" (builtins.readFile (self + "/VERSION"));
 
         lines = pkgs.lib.pipe (self + "/requirements.txt") [
           builtins.readFile
@@ -44,13 +40,17 @@
         ];
 
         pythonEnv = pkgs.python314.withPackages (ps: pythonDeps);
-
-        mixtapes = pkgs.stdenv.mkDerivation {
-          pname = "mixtapes";
+      in {
+        packages.default = pkgs.stdenv.mkDerivation {
+          pname = "ventapes";
           inherit version;
           src = self;
 
-          nativeBuildInputs = [ pkgs.makeWrapper pkgs.wrapGAppsHook3 ];
+          nativeBuildInputs = [
+            pkgs.makeWrapper
+            pkgs.wrapGAppsHook3
+            pkgs.glib
+          ];
 
           buildInputs = [
             pkgs.gtk4
@@ -66,19 +66,43 @@
           ];
 
           installPhase = ''
-            mkdir -p $out/bin $out/share/mixtapes
-            cp -r src/* $out/share/mixtapes/
-            makeWrapper ${pythonEnv}/bin/python $out/bin/mixtapes \
-              --add-flags "$out/share/mixtapes/main.py"
+            glib-compile-resources \
+              --sourcedir=. \
+              src/ventapes.gresource.xml \
+              --target=src/ventapes.gresource
+
+            mkdir -p \
+              $out/bin \
+              $out/share/ventapes \
+              $out/share/applications \
+              $out/share/metainfo \
+              $out/share/icons/hicolor/scalable/apps \
+              $out/share/icons/hicolor/symbolic/apps \
+              $out/share/licenses/ventapes
+            cp -r src/* $out/share/ventapes/
+            cp -r assets $out/share/ventapes/
+            install -Dm644 io.github.realvenerable.VenTapes.desktop \
+              $out/share/applications/io.github.realvenerable.VenTapes.desktop
+            install -Dm644 io.github.realvenerable.VenTapes.metainfo.xml \
+              $out/share/metainfo/io.github.realvenerable.VenTapes.metainfo.xml
+            install -Dm644 assets/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg \
+              $out/share/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg
+            install -Dm644 assets/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg \
+              $out/share/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg
+            install -Dm644 LICENSE $out/share/licenses/ventapes/LICENSE
+            install -Dm644 NOTICE.md $out/share/licenses/ventapes/NOTICE.md
+            install -Dm644 CREDITS.md $out/share/licenses/ventapes/CREDITS.md
+            install -Dm644 THIRD_PARTY_NOTICES.md $out/share/licenses/ventapes/THIRD_PARTY_NOTICES.md
+            makeWrapper ${pythonEnv}/bin/python $out/bin/ventapes \
+              --add-flags "$out/share/ventapes/main.py"
           '';
         };
-      in {
-        packages.default = mixtapes;
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ mixtapes ];
+          inputsFrom = [ self.packages.${system}.default ];
           packages = [ pkgs.nodejs ];
           shellHook = ''
+            echo "VenTapes: private learning fork; not a supported public release."
             python --version
           '';
         };

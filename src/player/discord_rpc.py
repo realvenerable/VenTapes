@@ -1,3 +1,6 @@
+# VenTapes (modified 2026-09-24) is based on Mixtapes and remains GPL-3.0-or-later.
+# See ../../NOTICE.md and ../../CREDITS.md.
+
 import json
 import os
 import queue
@@ -9,11 +12,11 @@ import time
 import uuid
 
 
-DISCORD_APP_ID = "1492500060087255231"
+DISCORD_APP_ID = os.environ.get("VENTAPES_DISCORD_APP_ID", "").strip()
 
 # Schedule of reconnect delays in seconds when the Discord IPC pipe isn't
 # reachable. After exhausting the list we stay at the final value, so the
-# tail is what dominates "Mixtapes opened before Discord" — keep it small
+# tail is what dominates "VenTapes opened before Discord" — keep it small
 # so a user who launches Discord a few minutes later sees Rich Presence
 # light up within ~30s rather than the previous 2-minute worst case. The
 # poll is essentially a single failed open()/connect(); cost is negligible.
@@ -29,7 +32,7 @@ STATUS_DISPLAY_DEFAULT = "artist"
 
 def _get_prefs():
     from gi.repository import GLib
-    path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     try:
         if os.path.exists(path):
             with open(path) as f:
@@ -40,7 +43,7 @@ def _get_prefs():
 
 
 def get_rpc_enabled():
-    return _get_prefs().get("discord_rpc_enabled", True)
+    return _get_prefs().get("discord_rpc_enabled", False)
 
 
 def get_status_display_type():
@@ -109,7 +112,7 @@ class DiscordRPCAdapter:
         self._connect_attempt = 0
         self._pid = os.getpid()
         self.status = "Disconnected"
-        self._enabled = get_rpc_enabled()
+        self._enabled = bool(app_id) and get_rpc_enabled()
         self._reconnect_lock = threading.Lock()
         self._reconnect_timer = None
 
@@ -119,7 +122,7 @@ class DiscordRPCAdapter:
             self._queue.put(("connect", None))
         else:
             self._worker = None
-            self.status = "Disabled"
+            self.status = "Unavailable" if not app_id else "Disabled"
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -128,6 +131,10 @@ class DiscordRPCAdapter:
             self._queue.put(("update", None))
 
     def set_enabled(self, enabled):
+        if enabled and not self.app_id:
+            self._enabled = False
+            self.status = "Unavailable"
+            return
         self._enabled = enabled
         if enabled and self._worker is None:
             self._stopping = False
@@ -400,10 +407,6 @@ class DiscordRPCAdapter:
             "status_display_type": display_type,
         }
 
-        mixtapes_logo = (
-            "https://raw.githubusercontent.com/m-obeid/Mixtapes/"
-            "main/screenshots/omori-mixtape.png"
-        )
         show_small_icon = get_small_icon_enabled()
         small_image = "pause" if state == "playing" else "play"
         small_text = "Playing" if state == "playing" else "Paused"
@@ -417,13 +420,10 @@ class DiscordRPCAdapter:
         if thumb.startswith("http"):
             activity["assets"] = {
                 "large_image": thumb,
-                "large_text": (album or title or "Mixtapes")[:128] or "Mixtapes",
+                "large_text": (album or title)[:128],
             }
         else:
-            activity["assets"] = {
-                "large_image": mixtapes_logo,
-                "large_text": "Mixtapes",
-            }
+            activity["assets"] = {"large_text": (album or title)[:128]}
         if show_small_icon:
             activity["assets"]["small_image"] = small_image
             activity["assets"]["small_text"] = small_text

@@ -38,7 +38,7 @@ class CardWrapLayout(Adw.WrapLayout):
     vfunc entirely once that widget has one.
     """
 
-    __gtype_name__ = "MuseCardWrapLayout"
+    __gtype_name__ = "VenTapesCardWrapLayout"
 
     def do_measure(self, widget, orientation, for_size):
         # A layout pass runs measure(H, -1), measure(V, final width), allocate.
@@ -103,7 +103,7 @@ class CardBinLayout(Gtk.BinLayout):
     layout manager and never reaches the widget's own measure vfunc.
     """
 
-    __gtype_name__ = "MuseCardBinLayout"
+    __gtype_name__ = "VenTapesCardBinLayout"
 
     def do_measure(self, widget, orientation, for_size):
         width, _n, _mb, _nb = Gtk.BinLayout.do_measure(
@@ -131,7 +131,7 @@ class CardBinLayout(Gtk.BinLayout):
 
 
 class MediaCardWidget(Gtk.Button):
-    __gtype_name__ = "MuseMediaCardWidget"
+    __gtype_name__ = "VenTapesMediaCardWidget"
 
     def __init__(
         self,

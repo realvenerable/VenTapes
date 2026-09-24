@@ -1,7 +1,17 @@
-from ytmusicapi import YTMusic
-# import json
+import os
+from pathlib import Path
 
-yt = YTMusic('data/headers_auth.json')
+from ytmusicapi import YTMusic
+
+
+def _auth_path():
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if not data_home:
+        data_home = str(Path.home() / ".local" / "share")
+    return str(Path(data_home) / "ventapes" / "headers_auth.json")
+
+
+yt = YTMusic(_auth_path())
 
 # Helper to find mix
 mix_id = None

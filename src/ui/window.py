@@ -9,6 +9,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Gtk, Gdk, Adw, GObject, Gio, GLib, Pango
 from player.player import Player
+from version import APP_VERSION
 from ui import color_utils
 from ui.util_classes import ScrolledWindow
 
@@ -131,7 +132,7 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(*args, **kwargs)
 
         self.set_default_size(1000, 700)
-        self.set_title("Mixtapes")
+        self.set_title("VenTapes")
         self._is_compact = False
 
         self._last_dominant_rgb = None
@@ -140,7 +141,7 @@ class MainWindow(Adw.ApplicationWindow):
         assets_path = os.path.join(project_root, "assets", "icons")
 
         icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-        icon_theme.add_resource_path("/com/pocoguy/muse/icons")
+        icon_theme.add_resource_path("/io/github/realvenerable/ventapes/icons")
 
         icon_theme.add_search_path(assets_path)
 
@@ -176,7 +177,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.switcher.set_stack(self.view_stack)
         self.switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
 
-        self.title_widget = Adw.WindowTitle(title="Mixtapes")
+        self.title_widget = Adw.WindowTitle(title="VenTapes")
 
         self.title_bin.set_child(self.switcher)
         self.header_bar.set_title_widget(self.title_bin)
@@ -622,7 +623,7 @@ class MainWindow(Adw.ApplicationWindow):
     def _read_appearance_prefs(self):
         """Return a small dict of just the appearance prefs we care about."""
         import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
         prefs = {}
         try:
             if os.path.exists(path):
@@ -1305,7 +1306,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def on_playlist_header_title_changed(self, page, title):
         if hasattr(self, "title_widget"):
-            self.title_widget.set_title(title if title else "Mixtapes")
+            self.title_widget.set_title(title if title else "VenTapes")
 
     def update_back_button_visibility(self, *args):
         # Refresh-button visibility follows the currently-visible page.
@@ -1328,7 +1329,7 @@ class MainWindow(Adw.ApplicationWindow):
                 self.back_btn.set_visible(False)
                 # Reset title when back at root
                 if hasattr(self, "title_widget"):
-                    self.title_widget.set_title("Mixtapes")
+                    self.title_widget.set_title("VenTapes")
 
                 # Refresh library if we just returned to root of library tab
                 if self.view_stack.get_visible_child_name() == "library" and hasattr(
@@ -1486,7 +1487,7 @@ class MainWindow(Adw.ApplicationWindow):
         app_section = Gio.Menu()
         app_section.append("Keyboard Shortcuts", "win.shortcuts")
         app_section.append("Preferences", "win.preferences")
-        app_section.append("About Mixtapes", "win.about")
+        app_section.append("About VenTapes", "win.about")
         app_section.append("Quit", "win.quit")
         menu.append_section(None, app_section)
 
@@ -2095,7 +2096,7 @@ class MainWindow(Adw.ApplicationWindow):
     }
 
     def _prefs_path(self):
-        return os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
 
     def _load_color_scheme_pref(self):
         import json as _json
@@ -2185,7 +2186,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _get_background_play_enabled(self):
         import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
         try:
             if os.path.exists(path):
                 with open(path) as f:
@@ -2225,18 +2226,26 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_about(self, action, param):
         about = Adw.AboutDialog()
-        about.set_application_icon("com.pocoguy.Muse")
-        about.set_application_name("Mixtapes")
-        about.set_developer_name("POCOGuy")
-        about.set_version("2026.09.12-0")
-        about.set_website("https://www.pocoguy.com/#!/mixtapes")
-        about.set_copyright("© 2026 POCOGuy")
+        about.set_application_icon("io.github.realvenerable.VenTapes")
+        about.set_application_name("VenTapes")
+        about.set_developer_name("realvenerable")
+        about.set_version(APP_VERSION)
+        about.set_website("https://github.com/realvenerable/VenTapes")
+        about.set_copyright(
+            "© 2026 realvenerable (VenTapes modifications)\n"
+            "Mixtapes is the work of Mohamad Obeid and its contributors"
+        )
         about.set_license_type(Gtk.License.GPL_3_0)
+        about.set_comments(
+            "A private learning experiment, not a supported or public release. "
+            "Based on Mixtapes by Mohamad Obeid and the Mixtapes contributors; "
+            "not affiliated with or endorsed by them, YouTube, or Google."
+        )
         about.present(self)
 
     def _read_sidebar_position(self):
         import json as _json
-        path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
         side = "left"
         try:
             if os.path.exists(path):
@@ -2364,7 +2373,7 @@ class MainWindow(Adw.ApplicationWindow):
         # Force offline mode
         import json as _json
 
-        _prefs_path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        _prefs_path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
         _prefs = {}
         try:
             if os.path.exists(_prefs_path):
@@ -2488,7 +2497,7 @@ class MainWindow(Adw.ApplicationWindow):
         history_row = Adw.ComboRow()
         history_row.set_title("Record Plays to History")
         history_row.set_subtitle(
-            "When Mixtapes should tell YouTube Music a song was played"
+            "When VenTapes should tell YouTube Music a song was played"
         )
         history_row.set_model(Gtk.StringList.new(history_labels))
         current_history_mode = _prefs.get("history_mode", "immediate")
@@ -2713,17 +2722,20 @@ class MainWindow(Adw.ApplicationWindow):
         rpc_enabled_row = Adw.SwitchRow()
         rpc_enabled_row.set_title("Enable Discord RPC")
         rpc_enabled_row.set_subtitle(
-            "Show what you're listening to on Discord"
+            "Uses VENTAPES_DISCORD_APP_ID; no upstream Discord application is reused"
         )
-        rpc_enabled_row.set_active(_prefs.get("discord_rpc_enabled", True))
+        rpc_enabled_row.set_active(_prefs.get("discord_rpc_enabled", False))
+        rpc_enabled_row.set_sensitive(bool(getattr(rpc_adapter, "app_id", "")))
 
         display_row = Adw.ComboRow()
         display_row.set_title("Status Display")
         display_row.set_subtitle("What appears in the status line under your name")
         display_keys = list(STATUS_DISPLAY_TYPES.keys())
-        display_labels = ["App Name (Mixtapes)", "Artist", "Song Title"]
+        display_labels = ["App Name (VenTapes)", "Artist", "Song Title"]
         display_row.set_model(Gtk.StringList.new(display_labels))
-        display_row.set_sensitive(rpc_enabled_row.get_active())
+        display_row.set_sensitive(
+            rpc_enabled_row.get_active() and bool(getattr(rpc_adapter, "app_id", ""))
+        )
 
         current_display = _prefs.get("discord_rpc_status_display", STATUS_DISPLAY_DEFAULT)
         for i, key in enumerate(display_keys):
@@ -2782,7 +2794,9 @@ class MainWindow(Adw.ApplicationWindow):
             "Display a small play or pause indicator on the album art"
         )
         small_icon_row.set_active(_prefs.get("discord_rpc_small_icon_enabled", True))
-        small_icon_row.set_sensitive(rpc_enabled_row.get_active())
+        small_icon_row.set_sensitive(
+            rpc_enabled_row.get_active() and bool(getattr(rpc_adapter, "app_id", ""))
+        )
 
         def on_small_icon_toggled(switch, pspec):
             _prefs["discord_rpc_small_icon_enabled"] = switch.get_active()
@@ -3480,7 +3494,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         def _await_approval(token, url):
             dialog = Adw.AlertDialog(
-                heading="Authorize Mixtapes",
+                heading="Authorize VenTapes",
                 body=(
                     "Approve access in the browser tab that just opened. "
                     "This closes on its own once Last.fm confirms."
@@ -4129,7 +4143,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.nav_view.pop_to_page(self.root_nav_page)
 
             self.view_stack.set_visible_child_name(row.name_id)
-            self.set_header_title("Mixtapes")
+            self.set_header_title("VenTapes")
 
             if row.name_id == "library":
                 self.library_page.load_library()

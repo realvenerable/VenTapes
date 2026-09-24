@@ -4,8 +4,8 @@ ytmusicapi
 yt-dlp>=2026.7.4
 yt-dlp-ejs>=0.8.0
 # PO-Token provider — unlocks GVS-token-gated formats (seekable Opus/itag 251).
-# Needs the `rustypipe-botguard` binary. Packaged builds (Flatpak, AUR, the
-# Windows installer) already bundle it. For a source checkout, put it on PATH:
+# Needs the `rustypipe-botguard` binary. Some inherited packaging recipes may
+# bundle it. For a source checkout, put it on PATH:
 #   cargo install rustypipe-botguard
 # or grab a prebuilt release from https://codeberg.org/ThetaDev/rustypipe-botguard
 yt-dlp-get-pot>=0.3.0

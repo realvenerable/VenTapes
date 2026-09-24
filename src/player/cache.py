@@ -23,7 +23,7 @@ class StreamCache:
     URL_TTL_SECONDS = 5 * 3600
 
     def __init__(self):
-        cache_dir = os.path.join(GLib.get_user_cache_dir(), "muse", "streams")
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), "ventapes", "streams")
         os.makedirs(cache_dir, exist_ok=True)
         self._cache_dir = cache_dir
         self._lock = threading.Lock()

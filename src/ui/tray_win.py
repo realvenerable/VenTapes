@@ -43,14 +43,14 @@ class TrayIcon:
             image = Image.new("RGB", (64, 64), color=(100, 100, 200))
 
         menu = pystray.Menu(
-            pystray.MenuItem("Show Mixtapes", self._on_show, default=True),
+            pystray.MenuItem("Show VenTapes", self._on_show, default=True),
             pystray.MenuItem("Play/Pause", self._on_play_pause),
             pystray.MenuItem("Next", self._on_next),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._on_quit),
         )
 
-        self._icon = pystray.Icon("mixtapes", image, "Mixtapes", menu)
+        self._icon = pystray.Icon("ventapes", image, "VenTapes", menu)
         self._icon.run()
 
     def _get_icon_path(self):
@@ -58,8 +58,8 @@ class TrayIcon:
         # Look for icon relative to the app
         base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         candidates = [
-            os.path.join(base, "windows", "mixtapes.ico"),
-            os.path.join(base, "assets", "mixtapes.ico"),
+            os.path.join(base, "windows", "ventapes.ico"),
+            os.path.join(base, "assets", "ventapes.ico"),
         ]
         for c in candidates:
             if os.path.exists(c):

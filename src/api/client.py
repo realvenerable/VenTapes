@@ -1,9 +1,12 @@
 import os
 import json
 import re
+import tempfile
 from ytmusicapi import YTMusic
 import ytmusicapi.navigation
 from gi.repository import GLib
+
+from version import APP_VERSION
 
 # Monkeypatch ytmusicapi.navigation.nav to handle UI changes like musicImmersiveHeaderRenderer
 _original_nav = ytmusicapi.navigation.nav
@@ -50,6 +53,36 @@ def robust_nav(root, items, none_if_absent=False):
 
 
 ytmusicapi.navigation.nav = robust_nav
+
+
+def _write_private_json(path, payload):
+    """Atomically write JSON with owner-only permissions where supported."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.name == "posix":
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".headers-auth-", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 
 
 def _extract_shelf_title(row):
@@ -1459,8 +1492,13 @@ class MusicClient:
 
     def _init(self):
         self.api = None
-        data_dir = os.path.join(GLib.get_user_data_dir(), "muse")
+        data_dir = os.path.join(GLib.get_user_data_dir(), "ventapes")
         self.auth_path = os.path.join(data_dir, "headers_auth.json")
+        if os.name == "posix" and os.path.isfile(self.auth_path):
+            try:
+                os.chmod(self.auth_path, 0o600)
+            except OSError:
+                pass
         self._is_authed = False
         self._playlist_cache = {}  # Cache fully-fetched playlists
         self._sort_metric_cache = {}  # (metric, browseId) -> {videoId: number}
@@ -1534,16 +1572,10 @@ class MusicClient:
                 else:
                     print("Saved session invalid.")
             except Exception as e:
-                print(f"Failed to load saved session: {e}")
+                print(f"Failed to load saved session ({type(e).__name__}).")
 
-        # 2. Check for browser.json in cwd (Manually provided)
-        browser_path = os.path.join(os.getcwd(), "browser.json")
-        if os.path.exists(browser_path):
-            print(f"Found browser.json at {browser_path}. Importing...")
-            if self.login(browser_path):
-                return True
-
-        # 3. Fallback
+        # No implicit CWD lookup: browser.json contains live credentials and
+        # must be selected explicitly by the user.
         print("Falling back to unauthenticated mode.")
         self.api = YTMusic()
         self._is_authed = False
@@ -1632,7 +1664,7 @@ class MusicClient:
 
     def login(self, auth_input):
         """
-        Robust login method for browser.json or headers dict.
+        Robust login method for an explicitly selected browser.json path or a headers dict.
         """
         try:
             headers = None
@@ -1675,15 +1707,8 @@ class MusicClient:
             # 4. Standardize headers and remove Bearer tokens
             headers = self._normalize_headers(headers)
 
-            # Save to data/headers_auth.json (Overwrite)
-            os.makedirs(os.path.dirname(self.auth_path), exist_ok=True)
-            if os.path.exists(self.auth_path):
-                try:
-                    os.remove(self.auth_path)
-                except Exception:
-                    pass
-            with open(self.auth_path, "w") as f:
-                json.dump(headers, f)
+            # Save authentication headers atomically with owner-only permissions.
+            _write_private_json(self.auth_path, headers)
 
             # Initialize API with dict directly
             print(f"Initializing YTMusic with headers: {list(headers.keys())}")
@@ -1707,10 +1732,9 @@ class MusicClient:
                 return False
 
         except Exception as e:
-            import traceback
-
-            print(f"Login exception: {e}")
-            traceback.print_exc()
+            # Do not print exception text or traceback: request exceptions can
+            # contain authentication headers or cookies.
+            print(f"Login exception ({type(e).__name__}).")
             self.api = YTMusic()
             self._is_authed = False
             return False
@@ -2829,7 +2853,7 @@ class MusicClient:
             url = "https://lrclib.net/api/search?" + urllib.parse.urlencode(params)
             try:
                 req = urllib.request.Request(
-                    url, headers={"User-Agent": "Mixtapes/1.0"},
+                    url, headers={"User-Agent": f"VenTapes/{APP_VERSION}"},
                 )
                 with urllib.request.urlopen(req, timeout=6) as resp:
                     data = _json.loads(resp.read())
@@ -3359,7 +3383,12 @@ class MusicClient:
         import urllib.error
         import json as _json
 
-        headers = {"User-Agent": "Mixtapes (https://github.com/m-obeid/Mixtapes)"}
+        headers = {
+            "User-Agent": (
+                f"VenTapes/{APP_VERSION} "
+                "(+https://github.com/realvenerable/VenTapes; based on Mixtapes)"
+            )
+        }
 
         def _hit(path, params):
             # Once a 429/timeout has tripped the cooldown, skip the remaining
@@ -3512,7 +3541,7 @@ class MusicClient:
             "term": term, "entity": "song", "limit": 8,
         })
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mixtapes/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": f"VenTapes/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=6) as resp:
                 data = _json.loads(resp.read())
         except Exception as e:
@@ -3716,7 +3745,7 @@ class MusicClient:
         try:
             url = f"https://lyrics.paxsenix.org/apple-music/lyrics?id={song_id}"
             req = urllib.request.Request(
-                url, headers={"User-Agent": "Mixtapes/1.0"},
+                url, headers={"User-Agent": f"VenTapes/{APP_VERSION}"},
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return _json.loads(resp.read())

@@ -8,7 +8,7 @@ _debug_enabled = False
 
 
 def _get_config_path():
-    data_dir = os.path.join(GLib.get_user_data_dir(), "muse")
+    data_dir = os.path.join(GLib.get_user_data_dir(), "ventapes")
     return os.path.join(data_dir, "config.json")
 
 

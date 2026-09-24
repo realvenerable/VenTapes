@@ -1,11 +1,18 @@
+from pathlib import Path
 
 from ytmusicapi import YTMusic
 import os
-import json
+
+
+def _auth_path():
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if not data_home:
+        data_home = str(Path.home() / ".local" / "share")
+    return str(Path(data_home) / "ventapes" / "headers_auth.json")
 
 def verify_auth():
     print("Verifying Authentication...")
-    auth_path = 'data/headers_auth.json'
+    auth_path = _auth_path()
     
     if not os.path.exists(auth_path):
         print("No auth file found.")

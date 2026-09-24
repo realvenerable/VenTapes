@@ -1,4 +1,5 @@
 import gi
+from urllib.parse import urlsplit
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -52,13 +53,32 @@ class WebkitLoginView(Adw.Bin):
         login_url = "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube&uilel=3&passive=true&continue=https%3A%2F%2Fmusic.youtube.com%2Flibrary"
         self.webview.load_uri(login_url)
 
+    @staticmethod
+    def _safe_uri(uri):
+        """Return a log-safe URL without query strings or fragments."""
+        try:
+            parts = urlsplit(uri or "")
+            if parts.scheme and parts.hostname:
+                host = parts.hostname
+                if parts.port:
+                    host = f"{host}:{parts.port}"
+                return f"{parts.scheme}://{host}{parts.path}"
+            return parts.path or "<unknown URL>"
+        except Exception:
+            return "<unparseable URL>"
+
     def _on_resource_load_started(self, webview, resource, request):
         uri = request.get_uri()
         headers = request.get_http_headers()
+        safe_uri = self._safe_uri(uri)
 
-        print(f"\n[NETWORK] Request to: {uri}")
+        # Never print header values: this signal includes cookies and
+        # Authorization/SAPISIDHASH credentials.
+        header_names = []
         if headers:
-            headers.foreach(lambda name, value: print(f"  > {name}: {value}"))
+            headers.foreach(lambda name, _value: header_names.append(name))
+        header_summary = ", ".join(sorted(header_names)) or "none"
+        print(f"\n[NETWORK] Request to: {safe_uri}; headers: {header_summary}")
 
         if self.finished:
             return
@@ -76,7 +96,7 @@ class WebkitLoginView(Adw.Bin):
                 has_auth_hash = auth and "SAPISIDHASH" in auth
 
                 if has_sapisid or has_auth_hash:
-                    print(f"\n!!! AUTHENTICATED BROWSE MATCH: {uri}")
+                    print(f"\n!!! AUTHENTICATED BROWSE MATCH: {safe_uri}")
 
                     # 1. Capture ALL current headers
                     self.captured_headers = {}
@@ -144,8 +164,11 @@ class WebkitLoginView(Adw.Bin):
 
     def _notify_success(self):
         print("Emitting login-finished with captured headers.")
-        # Pass the headers as a JSON string to keep it consistent with existing login logic
-        self.emit("login-finished", True, json.dumps(self.captured_headers))
+        # Pass the headers as a JSON string to keep it consistent with existing
+        # login logic, then drop the in-memory copy immediately.
+        payload = json.dumps(self.captured_headers)
+        self.captured_headers = {}
+        self.emit("login-finished", True, payload)
 
     def clear_webkit_cookies(self):
         """Clears all cookies from the WebKit session for security."""

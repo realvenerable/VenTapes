@@ -50,7 +50,7 @@ def _check_force_offline():
     if now < _FORCE_OFFLINE_CACHE["expires"]:
         return _FORCE_OFFLINE_CACHE["value"]
     import json
-    prefs_path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    prefs_path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     result = False
     try:
         if os.path.exists(prefs_path):
@@ -213,7 +213,7 @@ def _get_fetch_executor():
         if _FETCH_EXECUTOR is None:
             from concurrent.futures import ThreadPoolExecutor
             _FETCH_EXECUTOR = ThreadPoolExecutor(
-                max_workers=6, thread_name_prefix="muse-img"
+                max_workers=6, thread_name_prefix="ventapes-img"
             )
     return _FETCH_EXECUTOR
 
@@ -267,7 +267,7 @@ def resolve_local_cover(video_id):
             _LOCAL_COVER_CACHE[video_id] = None
         return None
 
-    cache_dir = os.path.join(GLib.get_user_cache_dir(), "muse", "covers")
+    cache_dir = os.path.join(GLib.get_user_cache_dir(), "ventapes", "covers")
     cover_path = os.path.join(cache_dir, f"{video_id}.jpg")
     if os.path.exists(cover_path):
         url = f"file://{cover_path}"
@@ -309,9 +309,9 @@ def invalidate_local_cover(video_id):
 # ── Persistent thumbnail cache on disk ─────────────────────────────────────
 # Avoids the placeholder-icon flash when returning to the library, and makes
 # subsequent launches render covers instantly. Files are raw image bytes
-# under XDG_CACHE/muse/thumbs/<sha1-of-url>.
+# under XDG_CACHE/ventapes/thumbs/<sha1-of-url>.
 def _thumb_cache_dir():
-    path = os.path.join(GLib.get_user_cache_dir(), "muse", "thumbs")
+    path = os.path.join(GLib.get_user_cache_dir(), "ventapes", "thumbs")
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:
@@ -528,7 +528,7 @@ def save_playlist_cover_async(player, title, url):
 
     Re-fetches when either (a) the local copy is older than a day, or (b) the
     cover's identity (the URL minus its signing query) differs from what we
-    last saved — so an edit on YT, or from Mixtapes, propagates on the next
+    last saved — so an edit on YT, or from VenTapes, propagates on the next
     library load instead of waiting out the freshness window. A `.url` sidecar
     records the identity of the bytes on disk.
 

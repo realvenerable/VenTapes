@@ -2,7 +2,7 @@
 Download manager for offline playback.
 
 Downloads songs with full ID3 metadata and cover art, stores them in
-~/Music/Mixtapes/Artist/Album/NN - Title.ext
+~/Music/VenTapes/Artist/Album/NN - Title.ext
 
 Never overwrites existing files. Tracks downloads in SQLite.
 Stores videoId and other YTM identifiers in metadata custom tags.
@@ -34,7 +34,7 @@ DEFAULT_FOLDER_STRUCTURE = "artist_album"
 
 # Temp-dir prefix lets us identify our own crash debris at startup without
 # trampling unrelated files in /tmp.
-TMP_PREFIX = "mixtapes_dl_"
+TMP_PREFIX = "ventapes_dl_"
 TMP_STALE_SECONDS = 3600  # only sweep dirs untouched for an hour — avoids
                           # clobbering a parallel running instance's work.
 
@@ -88,7 +88,7 @@ def _sanitize_filename(name):
 
 
 def _get_prefs():
-    path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     try:
         if os.path.exists(path):
             with open(path) as f:
@@ -99,7 +99,7 @@ def _get_prefs():
 
 
 def _save_prefs(prefs):
-    path = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+    path = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump(prefs, f)
@@ -146,8 +146,8 @@ def set_use_songs_subdir(enabled: bool):
 def _build_download_dir(music_dir, artist_str, album, structure):
     """Build the destination directory based on the chosen folder structure.
 
-    Songs are stored in ~/Music/Mixtapes/Songs/
-    Playlists remain in ~/Music/Mixtapes/Playlists/
+    Songs are stored in ~/Music/VenTapes/Songs/
+    Playlists remain in ~/Music/VenTapes/Playlists/
     """
 
     if use_songs_subdir():
@@ -174,114 +174,14 @@ def _build_download_dir(music_dir, artist_str, album, structure):
 
 
 def get_music_dir():
-    """Get the download directory: ~/Music/Mixtapes/"""
+    """Get the download directory: ~/Music/VenTapes/"""
     music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
     if not music:
         music = os.path.expanduser("~/Music")
-    return os.path.join(music, "Mixtapes")
+    return os.path.join(music, "VenTapes")
 
 
 _download_db_instance = None
-
-LEGACY_MUSIC_DIR_NAME = "YouTube Music"
-_legacy_migration_done = False
-
-
-def _maybe_migrate_legacy_music_dir():
-    """One-shot rename of ~/Music/YouTube Music/ to ~/Music/Mixtapes/ for users
-    upgrading from the pre-rename release. Must run before any code creates the
-    new dir, otherwise the rename target is taken and downloads are stranded."""
-    global _legacy_migration_done
-    if _legacy_migration_done:
-        return
-    _legacy_migration_done = True
-
-    music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
-    if not music:
-        music = os.path.expanduser("~/Music")
-    legacy_dir = os.path.join(music, LEGACY_MUSIC_DIR_NAME)
-    new_dir = os.path.join(music, "Mixtapes")
-
-    if not os.path.isdir(legacy_dir):
-        return
-    if not os.path.isfile(os.path.join(legacy_dir, ".mixtapes", "library.db")):
-        # Folder exists but isn't ours — could be the user's own music. Leave it.
-        return
-
-    if os.path.exists(new_dir):
-        if os.path.isfile(os.path.join(new_dir, ".mixtapes", "library.db")):
-            print(
-                f"[MIGRATION] Both {legacy_dir} and {new_dir} contain Mixtapes "
-                f"data; leaving legacy folder in place."
-            )
-            return
-        # Likely a stub the new code created on a prior launch (empty
-        # .mixtapes/ with no DB). Clear it so the rename can proceed.
-        import shutil
-        try:
-            shutil.rmtree(new_dir)
-        except OSError as e:
-            print(f"[MIGRATION] Could not clear stub at {new_dir}: {e}")
-            return
-
-    try:
-        os.rename(legacy_dir, new_dir)
-    except OSError as e:
-        print(f"[MIGRATION] Could not rename {legacy_dir} -> {new_dir}: {e}")
-        return
-    print(f"[MIGRATION] Renamed {legacy_dir} -> {new_dir}")
-
-    _rewrite_db_paths_after_rename(new_dir, legacy_dir, new_dir)
-    _rename_legacy_playlists_dir(new_dir)
-
-
-def _rewrite_db_paths_after_rename(music_dir, old_root, new_root):
-    """Update absolute file_path / cover_path entries to point at the renamed
-    folder. The DB stores full paths, so a folder rename alone leaves every
-    download row pointing at a missing file."""
-    db_path = os.path.join(music_dir, ".mixtapes", "library.db")
-    if not os.path.isfile(db_path):
-        return
-    try:
-        conn = sqlite3.connect(db_path)
-        old_prefix = old_root + os.sep
-        new_prefix = new_root + os.sep
-        for column in ("file_path", "cover_path"):
-            conn.execute(
-                f"UPDATE downloads "
-                f"SET {column} = ? || substr({column}, ?) "
-                f"WHERE substr({column}, 1, ?) = ?",
-                (new_prefix, len(old_prefix) + 1, len(old_prefix), old_prefix),
-            )
-        conn.commit()
-        conn.close()
-    except sqlite3.Error as e:
-        print(f"[MIGRATION] DB path rewrite failed: {e}")
-
-
-def _rename_legacy_playlists_dir(music_dir):
-    """The PR also recased `playlists` -> `Playlists`. On case-sensitive FS
-    (Linux) those are distinct dirs and the new code won't see the old one."""
-    old = os.path.join(music_dir, "playlists")
-    new = os.path.join(music_dir, "Playlists")
-    if not os.path.isdir(old):
-        return
-    if os.path.exists(new):
-        try:
-            if os.path.samefile(old, new):
-                return
-        except OSError:
-            pass
-        print(
-            f"[MIGRATION] Both {old} and {new} exist; leaving legacy "
-            f"playlists folder in place."
-        )
-        return
-    try:
-        os.rename(old, new)
-        print(f"[MIGRATION] Renamed {old} -> {new}")
-    except OSError as e:
-        print(f"[MIGRATION] Could not rename {old}: {e}")
 
 
 def get_download_db():
@@ -296,8 +196,7 @@ class DownloadDB:
     """SQLite database for tracking downloads."""
 
     def __init__(self):
-        _maybe_migrate_legacy_music_dir()
-        db_dir = os.path.join(get_music_dir(), ".mixtapes")
+        db_dir = os.path.join(get_music_dir(), ".ventapes")
         os.makedirs(db_dir, exist_ok=True)
         self._db_path = os.path.join(db_dir, "library.db")
         self._lock = threading.Lock()
@@ -1240,7 +1139,7 @@ class DownloadManager(GObject.Object):
             ytm_comment = json.dumps({
                 "videoId": video_id,
                 "albumId": album_id,
-                "source": "YouTube Music (Mixtapes)",
+                "source": "YouTube Music (VenTapes)",
             })
 
             trck_str = ""

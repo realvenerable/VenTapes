@@ -702,7 +702,7 @@ class SearchPage(Adw.Bin):
     @staticmethod
     def _get_prefs_path():
         import os
-        return os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+        return os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
 
     def _save_charts_country(self, code):
         import json, os

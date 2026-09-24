@@ -1,3 +1,7 @@
+# VenTapes (modified 2026-09-24) is free software under the GPL-3.0-or-later.
+# It is based on Mixtapes by Mohamad Obeid and the Mixtapes contributors.
+# See ../NOTICE.md and ../CREDITS.md.
+
 import sys
 import os
 
@@ -17,14 +21,14 @@ import os
 # makes the re-exec fire at most once; the child inherits the var and skips it.
 if sys.platform.startswith("linux") and "MALLOC_ARENA_MAX" not in os.environ:
     os.environ["MALLOC_ARENA_MAX"] = "2"
-    if os.environ.get("MUSE_NO_ARENA_REEXEC") != "1":
+    if os.environ.get("VENTAPES_NO_ARENA_REEXEC") != "1":
         try:
             # Decide how to re-exec by looking at what is ACTUALLY running us,
             # not at build-system markers (sys.frozen is PyInstaller-only;
             # Nuitka's __compiled__ isn't reliably visible in globals() across
             # build modes). /proc/self/exe is the real executable regardless of
             # how we were launched (PATH name, or a symlink like
-            # /usr/bin/mixtapes):
+            # /usr/bin/ventapes):
             #   • an interpreter (python…): argv[0] is our *script*, so re-exec
             #     sys.executable (preserves a virtualenv) with the full argv.
             #   • our own binary (Nuitka/PyInstaller/cx_Freeze): argv[0] is the
@@ -61,7 +65,7 @@ if sys.platform == "win32":
         _SetAppID = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
         _SetAppID.argtypes = [ctypes.c_wchar_p]
         _SetAppID.restype = ctypes.HRESULT
-        _SetAppID("com.pocoguy.Muse")
+        _SetAppID("io.github.realvenerable.VenTapes")
     except Exception:
         pass
 
@@ -125,7 +129,7 @@ def _apply_gsk_renderer_pref():
     try:
         import json
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-        prefs_path = os.path.join(base, "muse", "prefs.json")
+        prefs_path = os.path.join(base, "ventapes", "prefs.json")
         if not os.path.exists(prefs_path):
             return
         with open(prefs_path) as f:
@@ -149,20 +153,23 @@ import logger
 logger.setup_logging()
 
 
-class MusicApp(Adw.Application):
+class VenTapesApp(Adw.Application):
     def __init__(self):
         super().__init__(
-            application_id="com.pocoguy.Muse", flags=Gio.ApplicationFlags.FLAGS_NONE
+            application_id="io.github.realvenerable.VenTapes",
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
         )
 
         # Load GResource
         try:
-            resource_path = os.path.join(os.path.dirname(__file__), "muse.gresource")
+            resource_path = os.path.join(os.path.dirname(__file__), "ventapes.gresource")
             resource = Gio.Resource.load(resource_path)
             resource._register()
 
             # Add icon resource path
-            Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_resource_path("/com/pocoguy/muse/icons")
+            Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).add_resource_path(
+                "/io/github/realvenerable/ventapes/icons"
+            )
         except Exception as e:
             print(f"Failed to load GResource: {e}")
 
@@ -177,7 +184,7 @@ class MusicApp(Adw.Application):
             theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
             theme.set_search_path([assets_icons] + theme.get_search_path())
 
-        Gtk.Window.set_default_icon_name("com.pocoguy.Muse")
+        Gtk.Window.set_default_icon_name("io.github.realvenerable.VenTapes")
 
     def do_activate(self):
         # Load CSS
@@ -230,7 +237,7 @@ class MusicApp(Adw.Application):
 
 
 def main():
-    app = MusicApp()
+    app = VenTapesApp()
     return app.run(sys.argv)
 
 

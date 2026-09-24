@@ -39,7 +39,7 @@ def _install_css():
         _CSS_INSTALLED = True
 
 
-# Persisted at ~/.cache/muse/playlist_recents.json so the ordering survives
+# Persisted at ~/.cache/ventapes/playlist_recents.json so the ordering survives
 # restarts. {playlist_id: last_used_unix_ts}. Best-effort — any I/O failure
 # just falls back to alphabetical sort.
 _RECENTS_LOCK = threading.Lock()
@@ -47,7 +47,7 @@ _RECENTS_LOCK = threading.Lock()
 
 def _recents_path():
     return os.path.join(
-        GLib.get_user_cache_dir(), "muse", "playlist_recents.json"
+        GLib.get_user_cache_dir(), "ventapes", "playlist_recents.json"
     )
 
 

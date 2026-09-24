@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=VenTapes
+Comment=Unofficial personal learning fork of Mixtapes
+Exec=ventapes
+Icon=io.github.realvenerable.VenTapes
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=youtube;music;streaming;player;audio;learning;
+StartupNotify=true

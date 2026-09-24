@@ -53,8 +53,9 @@
   min-width: 220px;
 }
 
-/* Theme selector — verbatim from GNOME Text Editor's style.css, only
-   scoped by our `.themeselector` class instead of Text Editor's
+/* Theme selector — adapted from GNOME Text Editor's GPL-3.0 style.css:
+   https://github.com/GNOME/gnome-text-editor
+   Scoped by our `.themeselector` class instead of Text Editor's
    `themeselector` widget type. Three GtkCheckButton radios styled as
    circular swatches with a diagonal split for "follow" system; the
    built-in radio sub-node is translated into the bottom-right corner

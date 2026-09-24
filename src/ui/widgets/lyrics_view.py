@@ -34,10 +34,10 @@ from player import lyrics_prefs
 _PANGO_ALPHA_MAX = 65535
 
 
-# Toggle with MIXTAPES_LYRICS_DEBUG=1 (or =2 for tick-level chatter).
+# Toggle with VENTAPES_LYRICS_DEBUG=1 (or =2 for tick-level chatter).
 # Logs go to stdout, prefixed with the elapsed seconds since launch and
 # a [LYRICS] tag so they're easy to grep.
-_DEBUG_LEVEL = int(os.environ.get("MIXTAPES_LYRICS_DEBUG") or "0")
+_DEBUG_LEVEL = int(os.environ.get("VENTAPES_LYRICS_DEBUG") or "0")
 _DEBUG_T0 = time.monotonic()
 
 
@@ -305,7 +305,7 @@ class LyricRow(Gtk.ListBoxRow):
     between active and inactive doesn't re-layout the label.
     """
 
-    __gtype_name__ = "MixtapesLyricRow"
+    __gtype_name__ = "VenTapesLyricRow"
 
     def __init__(self, line, line_idx, second_line_mode="auto", 
                  effects=lyrics_prefs.EFFECTS_DEFAULT, sweep_end_ms=None,
@@ -1165,7 +1165,7 @@ class InterludeRow(Gtk.ListBoxRow):
     the row, which is what keeps a twenty-second break from looking
     frozen. Clicking seeks to the start of the break."""
 
-    __gtype_name__ = "MixtapesLyricInterludeRow"
+    __gtype_name__ = "VenTapesLyricInterludeRow"
 
     def __init__(self, start_s, end_s, effects=lyrics_prefs.EFFECTS_DEFAULT):
         super().__init__()

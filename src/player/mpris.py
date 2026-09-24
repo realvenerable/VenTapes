@@ -1,3 +1,6 @@
+# VenTapes (modified 2026-09-24) is based on Mixtapes and remains GPL-3.0-or-later.
+# See ../../NOTICE.md and ../../CREDITS.md.
+
 from __future__ import annotations
 from typing import override
 import gi
@@ -12,9 +15,9 @@ from mprisify.base import Position, PlayState, Volume, NAME
 from mprisify.enums import BusType, LoopStatus
 
 
-class MuseMprisAdapter(MprisAdapter):
+class VenTapesMprisAdapter(MprisAdapter):
     def __init__(self, player):
-        super().__init__(name="Mixtapes")
+        super().__init__(name="VenTapes")
         self.player = player
         self._last_pos = 0
 
@@ -43,7 +46,7 @@ class MuseMprisAdapter(MprisAdapter):
         return False
 
     def get_desktop_entry(self):
-        return "com.pocoguy.Muse"
+        return "io.github.realvenerable.VenTapes"
 
     def can_fullscreen(self) -> bool:
         return False
@@ -195,7 +198,7 @@ class MuseMprisAdapter(MprisAdapter):
         try:
             if self.player.current_queue_index == -1 or not self.player.queue:
                 return {
-                    "mpris:trackid": "/com/pocoguy/Muse/track/none",
+                    "mpris:trackid": "/io/github/realvenerable/VenTapes/track/none",
                     "xesam:title": "",
                     "xesam:artist": [],
                     "xesam:album": "",
@@ -237,7 +240,7 @@ class MuseMprisAdapter(MprisAdapter):
             album = str(album or "")
 
             m = {
-                "mpris:trackid": f"/com/pocoguy/Muse/track/{safe_id}",
+                "mpris:trackid": f"/io/github/realvenerable/VenTapes/track/{safe_id}",
                 "mpris:length": int(self.player.duration * 1_000_000)
                 if self.player.duration > 0
                 else 0,
@@ -258,13 +261,13 @@ class MuseMprisAdapter(MprisAdapter):
             return {}
 
 
-class MuseServer(Server[MprisAdapter, EventAdapter, MprisInterface[MprisAdapter]]):    
+class VenTapesServer(Server[MprisAdapter, EventAdapter, MprisInterface[MprisAdapter]]):
     @override
     def publish(self, bus_type: BusType = BusType.DEFAULT):
         if self._publication_token == None:
             super().publish(bus_type)
 
-class MuseEventAdapter(EventAdapter):
+class VenTapesEventAdapter(EventAdapter):
     def emit_all(self):
         # Useful for a full refresh (e.g., when a new client connects)
         self.on_player_all()

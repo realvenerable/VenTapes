@@ -1,0 +1,151 @@
+app-id: io.github.realvenerable.VenTapes
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.node24
+command: ventapes
+build-options:
+  append-path: /usr/lib/sdk/node24/bin
+  env:
+    NODEJS_DIR: /usr/lib/sdk/node24
+    FLATPAK_ENABLE_SDK_EXT: node24
+  build-args:
+    - --share=network
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --share=network
+  - --persist=.
+  - --device=dri
+  - --socket=session-bus
+  - --filesystem=xdg-music
+  - --filesystem=xdg-run/app/com.discordapp.Discord
+  - --filesystem=xdg-run/discord-ipc-0
+modules:
+  - name: nodejs-runtime
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    build-commands:
+      - install -Dm755 /usr/lib/sdk/node24/bin/node ${FLATPAK_DEST}/bin/node
+      - cp -ra /usr/lib/sdk/node24/lib ${FLATPAK_DEST}/ || true
+    sources: []
+
+  - name: rustypipe-botguard
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    build-commands:
+      - |
+        set -eu
+        case "$(uname -m)" in
+          x86_64)  triple=x86_64-unknown-linux-gnu;  sha=4f2ec561e8f9fadece7deadc6ce0624fbdedd852222c3eb194c22153b1323129 ;;
+          aarch64) triple=aarch64-unknown-linux-gnu; sha=4d038857374a69aea9be8ded981d93a776dc88d4e254f5c6d292746099abf69a ;;
+          *) echo "rustypipe-botguard: unsupported arch $(uname -m)" >&2; exit 1 ;;
+        esac
+        tarball="rustypipe-botguard-v0.1.2-${triple}.tar.xz"
+        if [ -f "$tarball" ]; then
+          cp "$tarball" bg.tar.xz
+        else
+          url="https://codeberg.org/ThetaDev/rustypipe-botguard/releases/download/v0.1.2/${tarball}"
+          if command -v curl >/dev/null 2>&1; then
+            curl -fL --retry 6 --retry-delay 5 --connect-timeout 30 -o bg.tar.xz "$url"
+          else
+            wget -t 6 --waitretry=5 --retry-on-http-error=429,500,502,503,504 -O bg.tar.xz "$url"
+          fi
+        fi
+        echo "${sha}  bg.tar.xz" | sha256sum -c -
+        tar -xf bg.tar.xz
+        install -Dm755 rustypipe-botguard ${FLATPAK_DEST}/bin/rustypipe-botguard
+        install -Dm644 LICENSE ${FLATPAK_DEST}/share/licenses/ventapes/rustypipe-botguard.txt
+    sources:
+      - type: file
+        only-arches:
+          - x86_64
+        path: vendor/rustypipe-botguard/rustypipe-botguard-v0.1.2-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 4f2ec561e8f9fadece7deadc6ce0624fbdedd852222c3eb194c22153b1323129
+      - type: file
+        only-arches:
+          - aarch64
+        path: vendor/rustypipe-botguard/rustypipe-botguard-v0.1.2-aarch64-unknown-linux-gnu.tar.xz
+        sha256: 4d038857374a69aea9be8ded981d93a776dc88d4e254f5c6d292746099abf69a
+      - type: file
+        path: vendor/rustypipe-botguard/LICENSE
+
+  - name: python-dependencies
+    buildsystem: simple
+    build-options:
+      no-debuginfo: true
+    build-commands:
+      - pip3 install --prefix=${FLATPAK_DEST} --no-cache-dir -r requirements.txt
+      - pip3 install --prefix=${FLATPAK_DEST} --no-cache-dir --upgrade "yt-dlp[default]"
+      - pip3 install --prefix=${FLATPAK_DEST} --no-cache-dir "yt-dlp-ejs"
+    sources:
+      - type: file
+        path: requirements.txt
+
+  - name: ventapes
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-cache-dir --target=nuitka-tools nuitka
+      - glib-compile-resources --sourcedir=. src/ventapes.gresource.xml --target=src/ventapes.gresource
+      - |
+        set -eu
+        root="$PWD"
+        cd src
+        PYTHONPATH="$root/nuitka-tools:${PYTHONPATH:-}" \
+          python3 -m nuitka \
+            --file-reference-choice=runtime \
+            --include-package=ui \
+            --include-package=api \
+            --include-package=player \
+            --include-module=logger \
+            --include-module=version \
+            --output-filename=ventapes \
+            --jobs="$(nproc)" \
+            --assume-yes-for-downloads \
+            main.py
+      - install -Dm755 src/ventapes ${FLATPAK_DEST}/lib/ventapes/src/ventapes
+      - install -Dm644 src/ventapes.gresource ${FLATPAK_DEST}/lib/ventapes/src/ventapes.gresource
+      - install -Dm644 src/ui/style.css ${FLATPAK_DEST}/lib/ventapes/src/ui/style.css
+      - cp -r assets ${FLATPAK_DEST}/lib/ventapes/
+      - install -Dm644 io.github.realvenerable.VenTapes.desktop ${FLATPAK_DEST}/share/applications/io.github.realvenerable.VenTapes.desktop
+      - install -Dm644 io.github.realvenerable.VenTapes.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.realvenerable.VenTapes.metainfo.xml
+      - install -Dm644 assets/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.realvenerable.VenTapes.svg
+      - install -Dm644 assets/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg ${FLATPAK_DEST}/share/icons/hicolor/symbolic/apps/io.github.realvenerable.VenTapes-symbolic.svg
+      - install -Dm644 LICENSE ${FLATPAK_DEST}/share/licenses/ventapes/LICENSE
+      - install -Dm644 NOTICE.md ${FLATPAK_DEST}/share/licenses/ventapes/NOTICE.md
+      - install -Dm644 CREDITS.md ${FLATPAK_DEST}/share/licenses/ventapes/CREDITS.md
+      - install -Dm644 THIRD_PARTY_NOTICES.md ${FLATPAK_DEST}/share/licenses/ventapes/THIRD_PARTY_NOTICES.md
+      - install -d ${FLATPAK_DEST}/bin
+      - |
+        cat > ${FLATPAK_DEST}/bin/ventapes << 'EOF'
+        #!/bin/sh
+        mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/ventapes"
+        cd "${XDG_DATA_HOME:-$HOME/.local/share}/ventapes"
+        exec /app/lib/ventapes/src/ventapes "$@"
+        EOF
+      - chmod +x ${FLATPAK_DEST}/bin/ventapes
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .venv
+          - .git
+          - .ccache
+          - build-dir
+          - .flatpak-builder
+          - src/main.build
+      - type: file
+        path: io.github.realvenerable.VenTapes.desktop
+      - type: file
+        path: io.github.realvenerable.VenTapes.metainfo.xml
+      - type: file
+        path: LICENSE
+      - type: file
+        path: NOTICE.md
+      - type: file
+        path: CREDITS.md

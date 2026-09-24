@@ -10,7 +10,7 @@ from ui.widgets.lyrics_view import LyricsView
 
 _PREFS_PATH = os.path.join(
     GLib.get_user_data_dir(),
-    "muse",
+    "ventapes",
     "prefs.json",
 )
 

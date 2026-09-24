@@ -1,33 +1,49 @@
 """
 Standalone YouTube Music login helper for Windows.
 Uses Edge WebView2 via pywebview to capture auth cookies,
-then writes them to a JSON file for Mixtapes to import.
+then writes them to a JSON file for VenTapes to import.
 
 Usage:
-  login_helper.exe [--output PATH]
+  VenTapesLogin.exe [--output PATH]
 
 Writes captured headers JSON to:
-  --output PATH   (default: %LOCALAPPDATA%/Mixtapes/login_headers.json)
+  --output PATH   (default: %LOCALAPPDATA%/ventapes/headers_auth.json)
 """
 
 import json
 import os
 import sys
+import tempfile
 import time
+from urllib.parse import urlsplit
 import webview
 
 
 OUTPUT_PATH = None
 
 
+def _safe_url(url):
+    """Return a log-safe URL without query strings or fragments."""
+    try:
+        parts = urlsplit(url or "")
+        if parts.scheme and parts.hostname:
+            host = parts.hostname
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            return f"{parts.scheme}://{host}{parts.path}"
+        return parts.path or "<unknown URL>"
+    except Exception:
+        return "<unparseable URL>"
+
+
 def get_default_output():
-    # Match the app's auth path: GLib.get_user_data_dir() + "/muse/headers_auth.json"
-    # On Windows: %LOCALAPPDATA%/muse/headers_auth.json
-    # On Linux: ~/.local/share/muse/headers_auth.json
+    # Match the app's auth path: GLib.get_user_data_dir() + "/ventapes/headers_auth.json"
+    # On Windows: %LOCALAPPDATA%/ventapes/headers_auth.json
+    # On Linux: ~/.local/share/ventapes/headers_auth.json
     appdata = os.environ.get("LOCALAPPDATA", "")
     if not appdata:
         appdata = os.path.join(os.path.expanduser("~"), ".local", "share")
-    d = os.path.join(appdata, "muse")
+    d = os.path.join(appdata, "ventapes")
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, "headers_auth.json")
 
@@ -44,7 +60,7 @@ def check_cookies(window):
         if "music.youtube.com" not in url or "accounts.google.com" in url:
             continue
 
-        print(f"[attempt {attempt}] On YouTube Music: {url}")
+        print(f"[attempt {attempt}] On YouTube Music: {_safe_url(url)}")
 
         # Strategy 1: pywebview get_cookies() — gets all cookies including HttpOnly
         try:
@@ -63,7 +79,7 @@ def check_cookies(window):
                         cookie_strs.append(f"{name}={value}")
                         if name in ("SAPISID", "__Secure-3PAPISID"):
                             has_sapisid = True
-                            print(f"  Found auth cookie: {name}={value}")
+                            print(f"  Found auth cookie: {name}")
 
             if has_sapisid:
                 _save_and_close(window, "; ".join(cookie_strs))
@@ -106,6 +122,36 @@ def _extract_sapisid(cookie_string):
     return None
 
 
+def _write_private_json(path, payload):
+    """Atomically write the captured headers with restrictive permissions."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.name == "posix":
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".headers-auth-", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
 def _save_and_close(window, cookie_string):
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     try:
@@ -134,9 +180,7 @@ def _save_and_close(window, cookie_string):
 
     output = OUTPUT_PATH or get_default_output()
     try:
-        os.makedirs(os.path.dirname(output), exist_ok=True)
-        with open(output, "w") as f:
-            json.dump(headers, f)
+        _write_private_json(output, headers)
         print(f"Login successful! Headers saved to: {output}")
     except Exception as e:
         print(f"Failed to save headers to {output}: {e}")
@@ -153,7 +197,7 @@ def main():
             OUTPUT_PATH = args[i + 1]
 
     window = webview.create_window(
-        "Mixtapes - Login to YouTube Music",
+        "VenTapes - Login to YouTube Music",
         "https://accounts.google.com/ServiceLogin?ltmpl=music&service=youtube"
         "&uilel=3&passive=true"
         "&continue=https%3A%2F%2Fmusic.youtube.com%2Flibrary",

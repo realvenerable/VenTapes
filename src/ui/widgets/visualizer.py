@@ -5,7 +5,7 @@ import os
 from gi.repository import Gtk, GLib
 
 
-_PREFS_PATH = os.path.join(GLib.get_user_data_dir(), "muse", "prefs.json")
+_PREFS_PATH = os.path.join(GLib.get_user_data_dir(), "ventapes", "prefs.json")
 
 
 def _load_pref(key, default):

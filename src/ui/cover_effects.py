@@ -115,7 +115,7 @@ _inflight_lock = threading.Lock()
 _inflight = {}  # url -> threading.Event
 _effect_executor = ThreadPoolExecutor(
     max_workers=2,
-    thread_name_prefix="muse-cover-effects",
+    thread_name_prefix="ventapes-cover-effects",
 )
 
 
@@ -156,7 +156,7 @@ def _get_color_cache(url):
 
 
 def _blur_cache_dir():
-    path = os.path.join(GLib.get_user_cache_dir(), "muse", "covers_blurred")
+    path = os.path.join(GLib.get_user_cache_dir(), "ventapes", "covers_blurred")
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:

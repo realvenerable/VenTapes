@@ -1,3 +1,4 @@
+import os
 import sys
 import gi
 
@@ -94,12 +95,12 @@ class LoginDialog(Adw.Window):
 
 <span size='large'><b>Step 2:</b> Follow instructions to paste headers.</span>
 
-<span size='large'><b>Step 3:</b> Click 'Import browser.json' below.</span>""")
+<span size='large'><b>Step 3:</b> Choose the exported browser.json file below.</span>""")
         lbl.set_xalign(0)
         box.append(lbl)
 
         # Action Button
-        self.btn_import = Gtk.Button(label="Import browser.json")
+        self.btn_import = Gtk.Button(label="Choose browser.json")
         self.btn_import.set_halign(Gtk.Align.CENTER)
         self.btn_import.add_css_class("pill")
         self.btn_import.add_css_class("suggested-action")
@@ -249,26 +250,43 @@ class LoginDialog(Adw.Window):
             print("Webkit capture failed")
 
     def on_import_clicked(self, btn):
-        import os
+        """Open an explicit file chooser instead of reading the CWD implicitly."""
+        dialog = Gtk.FileChooserNative(
+            title="Choose browser.json",
+            action=Gtk.FileChooserAction.OPEN,
+            accept_label="Import",
+            cancel_label="Cancel",
+        )
+        dialog.set_transient_for(self)
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name("JSON authentication files")
+        file_filter.add_pattern("*.json")
+        dialog.set_filter(file_filter)
+        dialog.connect("response", self._on_browser_file_selected)
+        self._browser_file_chooser = dialog
+        dialog.show()
 
-        # Check for browser.json in CWD
-        path = os.path.join(os.getcwd(), "browser.json")
-        if os.path.exists(path):
-            self.lbl_status.set_text(f"Found {path}...")
-            client = MusicClient()
-            if client.login(path):
-                self.lbl_status.set_markup(
-                    "<span color='green'>Login Successful! Restarting app...</span>"
-                )
-                # Close after delay?
-                self.close()
-            else:
-                self.lbl_status.set_markup(
-                    "<span color='red'>Login Failed. Check keys/headers.</span>"
-                )
+    def _on_browser_file_selected(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            selected_file = dialog.get_file()
+            path = selected_file.get_path() if selected_file else None
+            dialog.destroy()
+            if path:
+                self._import_browser_file(path)
+                return
+        dialog.destroy()
+
+    def _import_browser_file(self, path):
+        self.lbl_status.set_text(f"Selected {os.path.basename(path)}...")
+        client = MusicClient()
+        if client.login(path):
+            self.lbl_status.set_markup(
+                "<span color='green'>Login Successful!</span>"
+            )
+            self.close()
         else:
             self.lbl_status.set_markup(
-                f"<span color='orange'>File not found at {path}</span>"
+                "<span color='red'>Login Failed. Check keys/headers.</span>"
             )
 
     def on_manual_login(self, btn):

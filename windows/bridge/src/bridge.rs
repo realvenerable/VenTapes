@@ -1,6 +1,6 @@
-//! MixtapesBridge - Native Windows SMTC bridge
+//! VenTapesBridge - Native Windows SMTC bridge
 //!
-//! Communicates with the Mixtapes Python app via stdin/stdout JSON messages.
+//! Communicates with the VenTapes Python app via stdin/stdout JSON messages.
 //! Uses GetForWindow() with a hidden HWND so Windows resolves the app identity
 //! from this process's exe metadata (set via rcedit).
 //!
@@ -73,14 +73,13 @@ fn setup_smtc() -> windows::core::Result<SystemMediaTransportControls> {
     unsafe {
         // Set AppUserModelID
         windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-            windows::core::w!("com.pocoguy.Muse").as_ptr(),
+            windows::core::w!("io.github.realvenerable.VenTapes").as_ptr(),
         );
 
         // Register a minimal window class
-        let class_name = windows::core::w!("MixtapesBridgeClass");
-        let hinstance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(
-            std::ptr::null(),
-        );
+        let class_name = windows::core::w!("VenTapesBridgeClass");
+        let hinstance =
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
 
         let wc = windows_sys::Win32::UI::WindowsAndMessaging::WNDCLASSW {
             lpfnWndProc: Some(windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW),
@@ -100,9 +99,12 @@ fn setup_smtc() -> windows::core::Result<SystemMediaTransportControls> {
         let hwnd = windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
             0,
             class_name.as_ptr(),
-            windows::core::w!("Mixtapes").as_ptr(),
+            windows::core::w!("VenTapes").as_ptr(),
             0, // WS_OVERLAPPED but never shown
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             std::ptr::null_mut(), // no parent — top-level
             std::ptr::null_mut(),
             hinstance,
@@ -117,11 +119,10 @@ fn setup_smtc() -> windows::core::Result<SystemMediaTransportControls> {
         let hwnd_typed = windows::Win32::Foundation::HWND(hwnd);
 
         // Get SMTC via the interop interface bound to our HWND
-        let interop: ISystemMediaTransportControlsInterop =
-            windows::core::factory::<
-                SystemMediaTransportControls,
-                ISystemMediaTransportControlsInterop,
-            >()?;
+        let interop: ISystemMediaTransportControlsInterop = windows::core::factory::<
+            SystemMediaTransportControls,
+            ISystemMediaTransportControlsInterop,
+        >()?;
 
         let smtc: SystemMediaTransportControls = interop.GetForWindow(hwnd_typed)?;
 
@@ -135,33 +136,28 @@ fn setup_smtc() -> windows::core::Result<SystemMediaTransportControls> {
         smtc.SetPlaybackStatus(MediaPlaybackStatus::Closed)?;
 
         // Handle button presses
-        smtc.ButtonPressed(
-            &windows::Foundation::TypedEventHandler::<
-                SystemMediaTransportControls,
-                SystemMediaTransportControlsButtonPressedEventArgs,
-            >::new(|_, args| {
-                let button = args.as_ref().unwrap().Button()?;
-                let name = match button {
-                    SystemMediaTransportControlsButton::Play => "play",
-                    SystemMediaTransportControlsButton::Pause => "pause",
-                    SystemMediaTransportControlsButton::Next => "next",
-                    SystemMediaTransportControlsButton::Previous => "previous",
-                    SystemMediaTransportControlsButton::Stop => "stop",
-                    _ => return Ok(()),
-                };
-                send_event(name);
-                Ok(())
-            }),
-        )?;
+        smtc.ButtonPressed(&windows::Foundation::TypedEventHandler::<
+            SystemMediaTransportControls,
+            SystemMediaTransportControlsButtonPressedEventArgs,
+        >::new(|_, args| {
+            let button = args.as_ref().unwrap().Button()?;
+            let name = match button {
+                SystemMediaTransportControlsButton::Play => "play",
+                SystemMediaTransportControlsButton::Pause => "pause",
+                SystemMediaTransportControlsButton::Next => "next",
+                SystemMediaTransportControlsButton::Previous => "previous",
+                SystemMediaTransportControlsButton::Stop => "stop",
+                _ => return Ok(()),
+            };
+            send_event(name);
+            Ok(())
+        }))?;
 
         Ok(smtc)
     }
 }
 
-fn handle_command(
-    smtc: &SystemMediaTransportControls,
-    cmd: &Command,
-) -> windows::core::Result<()> {
+fn handle_command(smtc: &SystemMediaTransportControls, cmd: &Command) -> windows::core::Result<()> {
     match cmd.cmd.as_str() {
         "update_status" => {
             if let Some(status) = &cmd.status {

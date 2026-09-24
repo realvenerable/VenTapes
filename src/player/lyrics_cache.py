@@ -1,6 +1,6 @@
 """Disk-backed cache for lyrics fetched from any provider.
 
-One JSON file per videoId at ``~/.cache/muse/lyrics/<video_id>.json``.
+One JSON file per videoId at ``~/.cache/ventapes/lyrics/<video_id>.json``.
 Schema:
 
     {
@@ -65,7 +65,7 @@ _CACHE_DIR = None
 def _cache_dir():
     global _CACHE_DIR
     if _CACHE_DIR is None:
-        d = os.path.join(GLib.get_user_cache_dir(), "muse", "lyrics")
+        d = os.path.join(GLib.get_user_cache_dir(), "ventapes", "lyrics")
         os.makedirs(d, exist_ok=True)
         _CACHE_DIR = d
     return _CACHE_DIR

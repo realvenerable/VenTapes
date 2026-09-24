@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Development variant of the VenTapes private learning-fork identity. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">VenTapes development build</title>
+  <desc id="desc">The VenTapes cassette icon with a development accent stripe.</desc>
+  <defs>
+    <linearGradient id="background" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#513b7b"/>
+      <stop offset="0.52" stop-color="#282047"/>
+      <stop offset="1" stop-color="#151225"/>
+    </linearGradient>
+    <linearGradient id="tape" x1="27" y1="34" x2="101" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fffaf2"/>
+      <stop offset="1" stop-color="#ddd4ed"/>
+    </linearGradient>
+    <linearGradient id="label" x1="20" y1="0" x2="108" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff6b6b"/>
+      <stop offset="0.5" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="170%">
+      <feDropShadow dx="0" dy="5" stdDeviation="5" flood-color="#090714" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#background)"/>
+  <path d="M16 91c17 18 37 25 60 20 15-3 27-11 36-23" fill="none" stroke="#8b5cf6" stroke-width="4" stroke-linecap="round" opacity="0.45"/>
+
+  <g filter="url(#shadow)">
+    <rect x="16" y="29" width="96" height="72" rx="13" fill="url(#tape)" stroke="#171326" stroke-width="4"/>
+    <path d="M22 40h84v14H22z" fill="url(#label)"/>
+    <path d="M23 55h82" stroke="#2b2140" stroke-width="3" opacity="0.35"/>
+    <circle cx="43" cy="58" r="11" fill="#2b2140"/>
+    <circle cx="43" cy="58" r="5" fill="#f8f4ff"/>
+    <circle cx="85" cy="58" r="11" fill="#2b2140"/>
+    <circle cx="85" cy="58" r="5" fill="#f8f4ff"/>
+    <path d="M43 69c5 2 8 6 10 11 3-5 6-9 11-11 5 2 8 6 11 11 2-5 5-9 10-11" fill="none" stroke="#6d28d9" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="64" cy="75" r="4" fill="#ff6b6b"/>
+    <rect x="37" y="84" width="54" height="8" rx="4" fill="#2b2140"/>
+    <path d="M45 88h38" stroke="#8b5cf6" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="27" cy="90" r="3" fill="#9186aa"/>
+    <circle cx="101" cy="90" r="3" fill="#9186aa"/>
+  </g>
+
+  <path d="M91 9h27v11L91 47V9z" fill="#ffd166" stroke="#171326" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M98 18h12v5L98 35V18z" fill="#ff6b6b"/>
+</svg>

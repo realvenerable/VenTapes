@@ -1,5 +1,5 @@
 """
-Windows SMTC integration via the native MixtapesBridge.exe subprocess.
+Windows SMTC integration via the native VenTapesBridge.exe subprocess.
 Communicates via stdin/stdout JSON messages.
 """
 
@@ -15,7 +15,7 @@ if sys.platform != "win32":
 
 
 class SMTCAdapter:
-    """Bridges the GStreamer player to Windows SMTC via MixtapesBridge.exe."""
+    """Bridges the GStreamer player to Windows SMTC via VenTapesBridge.exe."""
 
     def __init__(self, player):
         self.player = player
@@ -27,8 +27,8 @@ class SMTCAdapter:
     def _find_bridge(self):
         base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         candidates = [
-            os.path.join(base, "windows", "MixtapesBridge.exe"),
-            os.path.join(base, "MixtapesBridge.exe"),
+            os.path.join(base, "windows", "VenTapesBridge.exe"),
+            os.path.join(base, "VenTapesBridge.exe"),
         ]
         for c in candidates:
             if os.path.exists(c):
@@ -38,7 +38,7 @@ class SMTCAdapter:
     def _start_bridge(self):
         bridge = self._find_bridge()
         if not bridge:
-            print("SMTC: MixtapesBridge.exe not found")
+            print("SMTC: VenTapesBridge.exe not found")
             return
 
         try:
