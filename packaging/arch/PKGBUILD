@@ -65,6 +65,9 @@ build() {
     'mprisify @ git+https://gitlab.com/zehkira/mprisify.git@v1.0.0' \
     'yt-dlp-get-pot>=0.3.0' \
     'yt-dlp-get-pot-rustypipe>=0.2.0'
+
+  find "$srcdir/ventapes-python" -type d -name __pycache__ -prune -exec rm -rf {} +
+  find "$srcdir/ventapes-python" -type f -name '*.pyc' -delete
 }
 
 package() {
